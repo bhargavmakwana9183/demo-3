@@ -25,6 +25,7 @@ import {
     place_order_on_upstocks,
 } from '../helpers';
 import { scalpingEngine } from '../services/scalping.engine';
+import { niftyScalpEngine } from '../services/nifty.scalp.engine';
 import { runScalpingBacktest } from '../helpers/scalping.backtest.helper';
 import { getAuditSkipBreakdown } from '../helpers/scalping.audit.helper';
 import { getScalpingPerformance } from '../helpers/scalping.performance.helper';
@@ -33,6 +34,13 @@ import {
     getScalpingSystemStatus,
 } from '../helpers/scalping.market.quality.helper';
 import { getStrategyConfig } from '../helpers/scalping.risk.helper';
+import { getNiftyScalpConfig } from '../helpers/nifty.scalp.config.helper';
+import { getNiftyAuditLogs } from '../helpers/nifty.scalp.audit.helper';
+import {
+    ensureNiftyStrategyRecords,
+    syncNiftyHedgingOptions,
+    syncNiftyOptionChain,
+} from '../helpers/nifty.chain.sync.helper';
 import { logger } from '../logger/logger';
 import { Op } from 'sequelize';
 import moment from 'moment';
@@ -1117,9 +1125,201 @@ class StrategyController {
     }
     async scallping_strategy_new() {
         try {
-            await scalpingEngine.run();
+            // LEGACY SBIN/scalping engine disabled — Nifty Options Scalp is active in app.ts
+            // await scalpingEngine.run();
+            return;
         } catch (error) {
             logger.error(error.message);
+        }
+    }
+
+    async nifty_options_scalp_run() {
+        try {
+            return await niftyScalpEngine.run();
+        } catch (error) {
+            logger.error(error.message);
+        }
+    }
+
+    async sync_nifty_option_chain(req, res, next) {
+        try {
+            await ensureNiftyStrategyRecords();
+            const result = await syncNiftyOptionChain();
+            return res.status(200).json({
+                status: RES_STATUS.CREATE,
+                data: result,
+                message: 'Nifty option_chain_details synced',
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    async sync_nifty_hedging_options(req, res, next) {
+        try {
+            await ensureNiftyStrategyRecords();
+            const chain = await syncNiftyOptionChain();
+            const hedging = await syncNiftyHedgingOptions();
+            return res.status(200).json({
+                status: RES_STATUS.CREATE,
+                data: { chain, hedging },
+                message: 'Nifty hedging_options_details synced',
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    async get_nifty_scalp_status(req, res, next) {
+        try {
+            const status = await niftyScalpEngine.getStatus();
+            const user = await db[MODEL.USER].findOne({
+                where: { email: USER_DETAILS.EMAIL },
+            });
+            return res.status(200).json({
+                status: RES_STATUS.GET,
+                data: {
+                    ...status,
+                    isLive: Boolean(user?.is_live),
+                },
+                message: 'Nifty scalp status fetched',
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    async get_nifty_scalp_audit(req, res, next) {
+        try {
+            const days = Number(req.query?.days ?? 7);
+            const action = req.query?.action as string | undefined;
+            const limit = Math.min(Number(req.query?.limit ?? 100), 500);
+            const logs = await getNiftyAuditLogs({ days, action, limit });
+            return res.status(200).json({
+                status: RES_STATUS.GET,
+                data: { logs },
+                message: 'Nifty scalp audit logs fetched',
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    async get_nifty_scalp_config(req, res, next) {
+        try {
+            const config = await getNiftyScalpConfig();
+            const user = await db[MODEL.USER].findOne({
+                where: { email: USER_DETAILS.EMAIL },
+            });
+            return res.status(200).json({
+                status: RES_STATUS.GET,
+                data: {
+                    config,
+                    isLive: Boolean(user?.is_live),
+                },
+                message: 'Nifty scalp config fetched',
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    async update_nifty_scalp_config(req, res, next) {
+        try {
+            const body = req.body ?? {};
+            const allowedModes = ['paper', 'live', 'backtest'];
+            if (body.mode && !allowedModes.includes(body.mode)) {
+                throw new AppError(
+                    `mode must be one of: ${allowedModes.join(', ')}`,
+                    ERRORTYPES.VALIDATION_ERROR,
+                );
+            }
+
+            const updates: Record<string, unknown> = {};
+            const fields = [
+                'mode',
+                'is_active',
+                'paper_balance',
+                'target_profit_rs',
+                'add_lot_points',
+                'enable_plan_b',
+                'enable_overnight_carry',
+                'plan_b_min_lots',
+                'plan_b_bounce_points',
+                'brokerage_per_lot',
+                'max_trades_per_day',
+                'entry_start_time',
+                'entry_cutoff_time',
+                'market_start_time',
+                'market_end_time',
+            ];
+            for (const key of fields) {
+                if (body[key] !== undefined) updates[key] = body[key];
+            }
+
+            if (Object.keys(updates).length === 0) {
+                throw new AppError(
+                    'No valid fields to update',
+                    ERRORTYPES.VALIDATION_ERROR,
+                );
+            }
+
+            await ensureNiftyStrategyRecords();
+            await db[MODEL.STRATEGY_CONFIG].update(updates, {
+                where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP },
+            });
+
+            if (typeof body.paper_balance === 'number') {
+                await db[MODEL.STRATEGY].update(
+                    { strategy_balance: body.paper_balance },
+                    { where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP } },
+                );
+            }
+
+            const config = await getNiftyScalpConfig();
+            const user = await db[MODEL.USER].findOne({
+                where: { email: USER_DETAILS.EMAIL },
+            });
+
+            return res.status(200).json({
+                status: RES_STATUS.UPDATE,
+                data: { config, isLive: Boolean(user?.is_live) },
+                message: 'Nifty scalp config updated',
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    async toggle_nifty_scalp_live(req, res, next) {
+        try {
+            const production =
+                bodyProduction(req.body?.production ?? req.body?.live ?? req.query?.production);
+
+            await ensureNiftyStrategyRecords();
+            await db[MODEL.STRATEGY_CONFIG].update(
+                { mode: production ? 'live' : 'paper' },
+                { where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP } },
+            );
+            await db[MODEL.USER].update(
+                { is_live: production },
+                { where: { email: USER_DETAILS.EMAIL } },
+            );
+
+            const config = await getNiftyScalpConfig();
+            return res.status(200).json({
+                status: RES_STATUS.UPDATE,
+                data: {
+                    production,
+                    mode: config.mode,
+                    isLive: production,
+                },
+                message: production
+                    ? 'Production ON — Upstox live orders enabled'
+                    : 'Production OFF — paper/dummy money mode',
+            });
+        } catch (error) {
+            return next(error);
         }
     }
 
@@ -2643,3 +2843,7 @@ class StrategyController {
 }
 
 export const strategyController = new StrategyController();
+
+function bodyProduction(value: unknown): boolean {
+    return value === true || value === 'true' || value === 1 || value === '1';
+}

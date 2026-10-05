@@ -56,6 +56,12 @@ export interface ScalpingConfig {
     enable_dynamic_atm: boolean;
     enable_liquidity_check: boolean;
     enable_expiry_rules: boolean;
+    target_profit_rs?: number;
+    add_lot_points?: number;
+    enable_plan_b?: boolean;
+    enable_overnight_carry?: boolean;
+    plan_b_min_lots?: number;
+    plan_b_bounce_points?: number;
 }
 
 const DEFAULT_SCALPING_CONFIG = {

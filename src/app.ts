@@ -28,10 +28,15 @@ import { Op } from 'sequelize';
 import axios from 'axios';
 import './utils/cron.job';
 import './utils/reconciliation.cron';
+import './utils/nifty.chain.cron';
 import {
-    processMarketFeed,
+    // LEGACY SBIN scalping feed — disabled while Nifty Options Scalp is active
+    // processMarketFeed,
     STRATEGY_THROTTLE_MS,
 } from './helpers/scalping.trade.helper';
+import { processNiftyMarketFeed } from './helpers/nifty.scalp.trade.helper';
+import { setNiftyNotifyEmitter } from './helpers/nifty.scalp.notify.helper';
+import { ensureNiftyStrategyRecords } from './helpers/nifty.chain.sync.helper';
 
 let protobufRoot = null;
 let defaultClient = UpstoxClient.ApiClient.instance;
@@ -61,6 +66,12 @@ class AppServer {
             path: '/api/socket',
         });
         this.io = io;
+        setNiftyNotifyEmitter((event, payload) => {
+            this.io.emit(event, payload);
+        });
+        ensureNiftyStrategyRecords().catch((err) =>
+            logger.error(`ensureNiftyStrategyRecords: ${err.message}`),
+        );
         this.io.on('connection', async (socket) => {
             // socket.emit('stock_data', stocks_data);
             socket.on('sendemit', (data) => {
@@ -173,10 +184,9 @@ class AppServer {
                 '2.0',
                 (error, data, response) => {
                     if (error) {
-                        // If there's an error, log it and reject the promise
                         console.log(error);
+                        reject(error);
                     } else {
-                        // If no error, log the returned data and resolve the promise
                         resolve(data.data.authorizedRedirectUri);
                     }
                 },
@@ -214,23 +224,60 @@ class AppServer {
                 console.log('connected');
                 resolve(ws);
                 setTimeout(async () => {
-                    const options = await db[MODEL.STRIKE_MODEL].findAll({});
+                    // Nifty Options Scalp: subscribe near-ATM hedging keys (+ index)
+                    const allOptions = await db[MODEL.HEDGING_OPTIONS].findAll(
+                        {},
+                    );
+                    let options = allOptions;
+                    try {
+                        const spotResp = await axios.get(
+                            'https://api.upstox.com/v2/market-quote/ltp',
+                            {
+                                headers: {
+                                    Authorization:
+                                        'Bearer ' + OAUTH2.accessToken,
+                                    Accept: 'application/json',
+                                },
+                                params: {
+                                    instrument_key: INDEXES.NIFTY_50,
+                                },
+                            },
+                        );
+                        let spot = 0;
+                        for (const key in spotResp.data?.data || {}) {
+                            spot = spotResp.data.data[key].last_price;
+                            break;
+                        }
+                        if (spot > 0) {
+                            const atm = Math.round(spot / 50) * 50;
+                            options = allOptions.filter((o) => {
+                                const strike = Number(o.strike_price);
+                                return (
+                                    !Number.isNaN(strike) &&
+                                    Math.abs(strike - atm) <= 50 * 10
+                                );
+                            });
+                        }
+                    } catch (e) {
+                        logger.warn(
+                            'ATM band filter failed; subscribing all hedging keys',
+                        );
+                    }
 
-                    // const strikes = await db[MODEL.INSTRUMENT].findAll({
-                    //     where: {
-                    //         instrument_key: 'NSE_EQ|INE062A01020',
-                    //     },
-                    //     attributes: ['id', 'instrument_key'],
-                    // });
-
-                    // const instrumentKeys_stike = strikes.map(
-                    //     (option) => option.instrument_key,
-                    // );
                     const instrumentKeys = options.map(
                         (option) => option.instrument_key,
                     );
-                    const instrument_data_keys = [...instrumentKeys];
-                    console.log(instrument_data_keys.length);
+                    const instrument_data_keys = [
+                        ...new Set(
+                            [...instrumentKeys, INDEXES.NIFTY_50].filter(
+                                Boolean,
+                            ),
+                        ),
+                    ];
+                    console.log(
+                        'Subscribing instruments:',
+                        instrument_data_keys.length,
+                    );
                     const data = {
                         typr: '',
                         guid: 'someguid',
@@ -251,12 +298,15 @@ class AppServer {
             ws.on('message', async (data) => {
                 const stocks_data: any = this.decodeProfobuf(data);
 
-                await processMarketFeed(stocks_data);
+                // LEGACY SBIN scalping feed — commented out
+                // await processMarketFeed(stocks_data);
+                await processNiftyMarketFeed(stocks_data);
 
                 const now = Date.now();
                 if (now - lastStrategyRunAt >= STRATEGY_THROTTLE_MS) {
                     lastStrategyRunAt = now;
-                    await strategyController.scallping_strategy_new();
+                    // LEGACY: await strategyController.scallping_strategy_new();
+                    await strategyController.nifty_options_scalp_run();
                 }
 
                 await this.emitTodayTrades();
@@ -293,10 +343,15 @@ class AppServer {
                 target: datas.target_price,
                 stopploss: datas.stop_loss,
                 profitLoss: datas.pl,
+                netPl: Number(datas.net_pl ?? datas.pl ?? 0),
+                charges: Number(datas.charges ?? 0),
                 quantity: Number(datas.lot_size) * Number(datas.qty),
                 status: datas.is_active ? 'in_trade' : 'closed',
                 trade_time: datas.createdAt,
                 strategy_name: datas.strategy_name,
+                instrument_type: datas.instrument_type,
+                exit_reason: datas.exit_reason,
+                highest_ltp: Number(datas.highest_ltp ?? datas.ltp ?? 0),
             });
         }
 
@@ -314,10 +369,10 @@ class AppServer {
             });
             ws.on('open', function open() {
                 console.log('connected order update ');
-                resolve(ws); // Resolve the promise when the WebSocket is opened
+                resolve(ws);
             });
 
-            ws.on('close', function close() {
+            ws.on('close', () => {
                 console.log('disconnected order update');
                 this.reconnectMarketFeed();
             });

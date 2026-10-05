@@ -877,6 +877,54 @@ class InstrumentsController {
 
     async stock_list(req, res, next) {
         try {
+            const nameFilter = String(req.query?.name || '').trim();
+            const isNifty =
+                nameFilter.toUpperCase() === 'NIFTY' ||
+                nameFilter.toUpperCase() === INDEXES_NAMES.NIFTY_50;
+
+            // Nifty Options Scalp uses hedging_options_details as the live option universe
+            if (isNifty) {
+                const where = { name: INDEXES_NAMES.NIFTY_50 };
+                const data = await db[MODEL.HEDGING_OPTIONS].findAll({
+                    where,
+                    ...req.paginations,
+                    order: [
+                        [
+                            sequelize.literal(`CASE 
+                                WHEN instrument_type = 'CE' THEN 1 
+                                WHEN instrument_type = 'PE' THEN 2 
+                                ELSE 3 
+                            END ASC`),
+                        ],
+                        ['strike_price', 'ASC'],
+                    ],
+                });
+                const count = await db[MODEL.HEDGING_OPTIONS].count({ where });
+                const formated = data.map((row) => ({
+                    id: row.id,
+                    name: row.name,
+                    trading_symbol: row.trading_symbol,
+                    instrument_type: row.instrument_type,
+                    strike_price: row.strike_price,
+                    ltp: row.ltp,
+                    lot_size: row.lot_size,
+                    expiry: row.expiry,
+                    instrument_key: row.instrument_key,
+                    is_active: true,
+                    buyPrice: Number(row.ltp || 0),
+                }));
+                return sendResponse(res, {
+                    responseType: RES_STATUS.GET,
+                    data: formated,
+                    total: count,
+                    paginations: {
+                        offset: req.paginations?.offset,
+                        limit: req.paginations?.limit,
+                    },
+                    message: res.__('instruments').insert,
+                });
+            }
+
             const data = await db[MODEL.STRIKE_MODEL].findAll({
                 ...req.paginations,
                 order: [
@@ -1031,23 +1079,33 @@ class InstrumentsController {
         try {
             const startOfMonth = moment().startOf('month').toDate();
             const endOfMonth = moment().endOf('month').toDate();
-            let pl = 0;
-            let tralling_pl = 0;
-            const currentMonthTradeCount = await db[MODEL.TRADE].findAll({
-                where: {
-                    createdAt: {
-                        [Op.between]: [startOfMonth, endOfMonth],
-                    },
+            const strategyName =
+                (req.query?.strategy_name as string) ||
+                STRATEGY.NIFTY_OPTIONS_SCALP;
+
+            const where: Record<string, unknown> = {
+                createdAt: {
+                    [Op.between]: [startOfMonth, endOfMonth],
                 },
+            };
+            if (strategyName && strategyName !== 'all') {
+                where.strategy_name = strategyName;
+            }
+
+            const currentMonthTrades = await db[MODEL.TRADE].findAll({
+                where,
             });
 
-            if (currentMonthTradeCount.length > 0) {
-                await Promise.all(
-                    currentMonthTradeCount.map(async (datas) => {
-                        pl += Number(datas.pl);
-                    }),
-                );
+            let pl = 0;
+            let netPl = 0;
+            let charges = 0;
+            for (const datas of currentMonthTrades) {
+                pl += Number(datas.pl || 0);
+                netPl += Number(datas.net_pl ?? datas.pl ?? 0);
+                charges += Number(datas.charges ?? 0);
             }
+
+            let tralling_pl = 0;
             const currentMonthTrallingStop = await db[MODEL.TRADE].findAll({
                 where: {
                     createdAt: {
@@ -1056,22 +1114,24 @@ class InstrumentsController {
                     strategy_name: STRATEGY.SCALLPING_TRAILLING,
                 },
             });
-
-            if (currentMonthTrallingStop.length > 0) {
-                await Promise.all(
-                    currentMonthTrallingStop.map(async (datas) => {
-                        tralling_pl += Number(datas.pl);
-                    }),
-                );
+            for (const datas of currentMonthTrallingStop) {
+                tralling_pl += Number(datas.pl || 0);
             }
+
+            const strategy = await db[MODEL.STRATEGY].findOne({
+                where: { strategy_name: strategyName },
+            });
 
             return sendResponse(res, {
                 responseType: RES_STATUS.GET,
                 data: {
+                    strategyName,
                     monthlyProfitLoss: pl,
+                    monthlyNetPl: netPl,
+                    monthlyCharges: charges,
                     tralling_pl: tralling_pl,
-                    accountBalance: 0,
-                    totalTrades: currentMonthTradeCount.length,
+                    accountBalance: Number(strategy?.strategy_balance || 0),
+                    totalTrades: currentMonthTrades.length,
                 },
                 message: res.__('instruments').insert,
             });

@@ -207,6 +207,30 @@ export const strategyConfigModel = (sequelize) => {
                 type: DataTypes.BOOLEAN,
                 defaultValue: true,
             },
+            target_profit_rs: {
+                type: DataTypes.FLOAT,
+                defaultValue: 200,
+            },
+            add_lot_points: {
+                type: DataTypes.FLOAT,
+                defaultValue: 10,
+            },
+            enable_plan_b: {
+                type: DataTypes.BOOLEAN,
+                defaultValue: true,
+            },
+            enable_overnight_carry: {
+                type: DataTypes.BOOLEAN,
+                defaultValue: true,
+            },
+            plan_b_min_lots: {
+                type: DataTypes.INTEGER,
+                defaultValue: 2,
+            },
+            plan_b_bounce_points: {
+                type: DataTypes.FLOAT,
+                defaultValue: 3,
+            },
         },
         {
             paranoid: true,

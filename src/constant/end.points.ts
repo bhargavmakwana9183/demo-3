@@ -43,4 +43,10 @@ export enum END_POINTS {
     SCALPING_OPTIMIZE = '/scalping-optimize',
     SCALPING_STATUS = '/scalping-status',
     STRATEGY_CONFIG = '/strategy-config',
+    NIFTY_SCALP_SYNC_CHAIN = '/nifty-scalp/sync-chain',
+    NIFTY_SCALP_SYNC_HEDGING = '/nifty-scalp/sync-hedging',
+    NIFTY_SCALP_STATUS = '/nifty-scalp/status',
+    NIFTY_SCALP_AUDIT = '/nifty-scalp/audit',
+    NIFTY_SCALP_CONFIG = '/nifty-scalp/config',
+    NIFTY_SCALP_TOGGLE_LIVE = '/nifty-scalp/toggle-live',
 }

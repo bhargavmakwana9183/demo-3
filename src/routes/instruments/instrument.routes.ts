@@ -113,6 +113,34 @@ class InstrumentRoutes extends BaseRoute {
             END_POINTS.STRATEGY_CONFIG,
             strategyController.update_strategy_config,
         );
+        this.router.post(
+            END_POINTS.NIFTY_SCALP_SYNC_CHAIN,
+            strategyController.sync_nifty_option_chain,
+        );
+        this.router.post(
+            END_POINTS.NIFTY_SCALP_SYNC_HEDGING,
+            strategyController.sync_nifty_hedging_options,
+        );
+        this.router.get(
+            END_POINTS.NIFTY_SCALP_STATUS,
+            strategyController.get_nifty_scalp_status,
+        );
+        this.router.get(
+            END_POINTS.NIFTY_SCALP_AUDIT,
+            strategyController.get_nifty_scalp_audit,
+        );
+        this.router.get(
+            END_POINTS.NIFTY_SCALP_CONFIG,
+            strategyController.get_nifty_scalp_config,
+        );
+        this.router.patch(
+            END_POINTS.NIFTY_SCALP_CONFIG,
+            strategyController.update_nifty_scalp_config,
+        );
+        this.router.post(
+            END_POINTS.NIFTY_SCALP_TOGGLE_LIVE,
+            strategyController.toggle_nifty_scalp_live,
+        );
 
         this.router.get(END_POINTS.DASHBOARD, instrumentsController.dashboard);
     }
