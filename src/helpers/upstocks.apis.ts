@@ -5,6 +5,12 @@ export const place_order_on_upstocks = async (data) => {
     try {
         const url = 'https://api-hft.upstox.com/v3/order/place';
         const accessToken = data.accessToken;
+        // Upstox API rejects MARKET with market_protection=0 (UDAPI1158).
+        // -1 = exchange guideline protection; 1–25 = custom % cap on slippage.
+        const marketProtection =
+            data.market_protection !== undefined
+                ? Number(data.market_protection)
+                : -1;
         const payload = {
             quantity: data.quantity,
             product: 'D',
@@ -17,8 +23,8 @@ export const place_order_on_upstocks = async (data) => {
             disclosed_quantity: 0,
             trigger_price: 0,
             is_amo: false,
-            slice: false,
-            market_protection: 0,
+            slice: Boolean(data.slice),
+            market_protection: marketProtection,
         };
         const response = await axios.post(url, payload, {
             headers: {
