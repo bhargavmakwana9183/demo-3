@@ -141,6 +141,10 @@ class InstrumentRoutes extends BaseRoute {
             END_POINTS.NIFTY_SCALP_TOGGLE_LIVE,
             strategyController.toggle_nifty_scalp_live,
         );
+        this.router.post(
+            END_POINTS.NIFTY_SCALP_MANUAL_ENTRY,
+            strategyController.manual_nifty_scalp_entry,
+        );
 
         this.router.get(END_POINTS.DASHBOARD, instrumentsController.dashboard);
     }

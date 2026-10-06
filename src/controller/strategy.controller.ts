@@ -41,6 +41,7 @@ import {
     syncNiftyHedgingOptions,
     syncNiftyOptionChain,
 } from '../helpers/nifty.chain.sync.helper';
+import { manualOpenNiftyScalpEntry } from '../helpers/nifty.scalp.trade.helper';
 import { logger } from '../logger/logger';
 import { Op } from 'sequelize';
 import moment from 'moment';
@@ -1317,6 +1318,67 @@ class StrategyController {
                 message: production
                     ? 'Production ON — Upstox live orders enabled'
                     : 'Production OFF — paper/dummy money mode',
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    /**
+     * Manual test entry: place Upstox BUY (if live) then hand off to Nifty engine
+     * for target / add-lot / Plan B management.
+     */
+    async manual_nifty_scalp_entry(req, res, next) {
+        try {
+            const body = req.body ?? {};
+            const instrumentKey =
+                body.instrument_key || body.instrumentKey || null;
+            const hedgingOptionId =
+                body.hedging_option_id ||
+                body.hedgingOptionId ||
+                body.stockId ||
+                body.id ||
+                null;
+            const lots = Number(body.lots ?? body.qty ?? 1);
+            const referenceBuyPrice = Number(
+                body.buy_price ?? body.buyPrice ?? body.price ?? 0,
+            );
+
+            if (!instrumentKey && !hedgingOptionId) {
+                throw new AppError(
+                    'instrument_key or hedging_option_id is required',
+                    ERRORTYPES.VALIDATION_ERROR,
+                );
+            }
+
+            const result = await manualOpenNiftyScalpEntry({
+                instrumentKey: instrumentKey || undefined,
+                hedgingOptionId: hedgingOptionId || undefined,
+                lots,
+                referenceBuyPrice:
+                    referenceBuyPrice > 0 ? referenceBuyPrice : undefined,
+            });
+
+            if (!result.ok) {
+                throw new AppError(
+                    result.error || 'Manual entry failed',
+                    ERRORTYPES.VALIDATION_ERROR,
+                );
+            }
+
+            return res.status(200).json({
+                status: RES_STATUS.CREATE,
+                data: {
+                    liveMode: result.liveMode,
+                    fillPrice: result.fillPrice,
+                    entryOrderId: result.entryOrderId,
+                    trade: result.trade,
+                    position: result.position,
+                    targetPrice: result.trade?.target_price,
+                },
+                message: result.liveMode
+                    ? 'Manual Upstox BUY confirmed — engine will manage target / Plan B'
+                    : 'Manual paper entry opened — engine will manage target / Plan B',
             });
         } catch (error) {
             return next(error);

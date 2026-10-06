@@ -31,7 +31,9 @@ export type NiftyEngineState =
     | 'IN_TRADE'
     | 'AVERAGING'
     | 'RECOVERY'
-    | 'CARRY_FORWARD';
+    | 'CARRY_FORWARD'
+    | 'EXIT_PENDING'
+    | 'HALTED';
 
 export class NiftyScalpEngine {
     private lastCarryLogDate: string | null = null;
@@ -135,6 +137,66 @@ export class NiftyScalpEngine {
         const netPl = grossPl - charges;
 
         recordNiftyPriceTick(String(trade.id), ltp);
+
+        // Live exit halted after max SELL failures — do not auto-manage
+        if (trade.exit_halted) {
+            await logNiftyAudit({
+                action: 'LIVE_ORDER_FAIL',
+                reason: 'EXIT_HALTED',
+                instrumentKey: trade.instrument_key,
+                tradeId: trade.id,
+                engineState: 'IN_TRADE',
+                config,
+                metadata: {
+                    ltp,
+                    retries: trade.exit_retry_count,
+                    lastError: trade.last_order_error,
+                    thinking:
+                        'Exit HALTED. Trade stays OPEN in DB until manual Upstox square-off + reconcile.',
+                },
+            });
+            return 'HALTED';
+        }
+
+        // Exit pending: retry / resume confirm — never paper-close
+        if (trade.exit_pending) {
+            await logNiftyAudit({
+                action: 'HOLD',
+                reason: 'EXIT_PENDING_RETRY',
+                instrumentKey: trade.instrument_key,
+                tradeId: trade.id,
+                engineState: 'IN_TRADE',
+                config,
+                metadata: {
+                    ltp,
+                    exitOrderId: trade.exit_order_id,
+                    retries: trade.exit_retry_count,
+                    pendingReason: trade.pending_exit_reason,
+                },
+            });
+            const closed = await closeNiftyScalpTrade({
+                trade,
+                position,
+                config,
+                exitReason:
+                    trade.pending_exit_reason || trade.exit_reason || 'EXIT',
+            });
+            return closed ? 'SCANNING' : 'EXIT_PENDING';
+        }
+
+        // Live entry must be broker-confirmed before averaging / plan B
+        if (config.mode === 'live' && !trade.broker_confirmed) {
+            await logNiftyAudit({
+                action: 'HOLD',
+                reason: 'WAITING_ENTRY_CONFIRM',
+                instrumentKey: trade.instrument_key,
+                tradeId: trade.id,
+                engineState: 'IN_TRADE',
+                config,
+                metadata: { entryOrderId: trade.entry_order_id },
+            });
+            return 'IN_TRADE';
+        }
 
         await logNiftyAudit({
             action: 'HOLD',

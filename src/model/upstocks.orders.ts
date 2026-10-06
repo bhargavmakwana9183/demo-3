@@ -25,7 +25,40 @@ export const UpstocksOrderModel = (sequelize) => {
             status: {
                 type: DataTypes.TEXT,
                 defaultValue: 'Pending',
-                commet: 'Pending , Success , Failed',
+                comment: 'Pending, open, complete, rejected, cancelled, failed',
+            },
+            trade_id: {
+                type: DataTypes.UUID,
+                allowNull: true,
+            },
+            instrument_key: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
+            quantity: {
+                type: DataTypes.FLOAT,
+                allowNull: true,
+            },
+            purpose: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
+            average_price: {
+                type: DataTypes.FLOAT,
+                allowNull: true,
+            },
+            filled_quantity: {
+                type: DataTypes.FLOAT,
+                allowNull: true,
+                defaultValue: 0,
+            },
+            rejection_reason: {
+                type: DataTypes.TEXT,
+                allowNull: true,
+            },
+            strategy_name: {
+                type: DataTypes.STRING,
+                allowNull: true,
             },
         },
         {

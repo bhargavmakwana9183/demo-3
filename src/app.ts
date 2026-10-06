@@ -37,6 +37,8 @@ import {
 import { processNiftyMarketFeed } from './helpers/nifty.scalp.trade.helper';
 import { setNiftyNotifyEmitter } from './helpers/nifty.scalp.notify.helper';
 import { ensureNiftyStrategyRecords } from './helpers/nifty.chain.sync.helper';
+import { handleNiftyOrderStatusUpdate } from './helpers/nifty.scalp.order.helper';
+import './utils/nifty.reconciliation.cron';
 
 let protobufRoot = null;
 let defaultClient = UpstoxClient.ApiClient.instance;
@@ -381,13 +383,24 @@ class AppServer {
                 const order_data = JSON.parse(data.toString());
                 console.log(order_data);
 
+                // Drive Nifty order lifecycle (confirm / reject / finalize exit)
+                try {
+                    await handleNiftyOrderStatusUpdate(order_data);
+                } catch (err: any) {
+                    console.error(
+                        'handleNiftyOrderStatusUpdate error:',
+                        err?.message || err,
+                    );
+                }
+
+                // Keep generic status patch for non-Nifty / legacy rows
                 const find_order = await db[MODEL.UPSTOCK_ORDERS].findOne({
                     where: {
                         upstock_order_id: order_data.order_id,
                     },
                 });
 
-                if (find_order) {
+                if (find_order && !find_order.purpose) {
                     await db[MODEL.UPSTOCK_ORDERS].update(
                         {
                             status: order_data.status,

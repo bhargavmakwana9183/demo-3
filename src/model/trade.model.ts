@@ -96,6 +96,43 @@ export const tradeModel = (sequelize) => {
                 type: DataTypes.STRING,
                 allowNull: true,
             },
+            order_lifecycle: {
+                type: DataTypes.STRING,
+                allowNull: true,
+                defaultValue: 'OPEN',
+            },
+            broker_confirmed: {
+                type: DataTypes.BOOLEAN,
+                defaultValue: false,
+            },
+            entry_order_id: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
+            exit_order_id: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
+            exit_pending: {
+                type: DataTypes.BOOLEAN,
+                defaultValue: false,
+            },
+            exit_retry_count: {
+                type: DataTypes.INTEGER,
+                defaultValue: 0,
+            },
+            exit_halted: {
+                type: DataTypes.BOOLEAN,
+                defaultValue: false,
+            },
+            last_order_error: {
+                type: DataTypes.TEXT,
+                allowNull: true,
+            },
+            pending_exit_reason: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
         },
         {
             paranoid: true,

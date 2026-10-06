@@ -49,4 +49,5 @@ export enum END_POINTS {
     NIFTY_SCALP_AUDIT = '/nifty-scalp/audit',
     NIFTY_SCALP_CONFIG = '/nifty-scalp/config',
     NIFTY_SCALP_TOGGLE_LIVE = '/nifty-scalp/toggle-live',
+    NIFTY_SCALP_MANUAL_ENTRY = '/nifty-scalp/manual-entry',
 }
