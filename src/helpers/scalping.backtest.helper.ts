@@ -44,7 +44,7 @@ export interface BacktestResult {
     wins: number;
     losses: number;
     winRate: number;
-    profitFactor: number;
+    profitFactor: number | null;
     totalGrossPl: number;
     totalNetPl: number;
     maxDrawdown: number;
@@ -405,7 +405,11 @@ export const runScalpingBacktest = async ({
         losses,
         winRate: trades.length ? (wins / trades.length) * 100 : 0,
         profitFactor:
-            grossLosses > 0 ? grossWins / grossLosses : grossWins > 0 ? Infinity : 0,
+            grossLosses > 0
+                ? grossWins / grossLosses
+                : grossWins > 0
+                  ? null
+                  : 0,
         totalGrossPl: trades.reduce((s, t) => s + t.grossPl, 0),
         totalNetPl: trades.reduce((s, t) => s + t.netPl, 0),
         maxDrawdown,

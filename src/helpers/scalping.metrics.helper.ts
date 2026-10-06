@@ -15,7 +15,7 @@ export interface PerformanceMetrics {
     wins: number;
     losses: number;
     winRate: number;
-    profitFactor: number;
+    profitFactor: number | null;
     avgWin: number;
     avgLoss: number;
     expectancy: number;
@@ -47,7 +47,7 @@ export const computePerformanceMetrics = (
         grossLosses > 0
             ? grossWins / grossLosses
             : grossWins > 0
-              ? Infinity
+              ? null // Infinity is not JSON-safe; clients treat null as ∞
               : 0;
     const avgWin = wins.length ? grossWins / wins.length : 0;
     const avgLoss = losses.length

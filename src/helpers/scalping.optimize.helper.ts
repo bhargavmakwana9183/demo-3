@@ -49,8 +49,14 @@ export interface OptimizationReport {
     applied: boolean;
 }
 
+const pfScore = (value: number | null | undefined): number => {
+    if (value == null) return Number.POSITIVE_INFINITY;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : Number.POSITIVE_INFINITY;
+};
+
 const summarizeBacktest = (result: BacktestResult) => ({
-    profitFactor: result.profitFactor,
+    profitFactor: result.profitFactor == null ? null : Number(result.profitFactor),
     winRate: result.winRate,
     totalNetPl: result.totalNetPl,
     totalTrades: result.totalTrades,
@@ -124,11 +130,17 @@ export const runScalpingOptimization = async ({
                 { [param]: value },
             );
             const summary = summarizeBacktest(result);
-            trials.push({ value, ...summary });
+            trials.push({
+                value,
+                profitFactor: pfScore(summary.profitFactor),
+                winRate: summary.winRate,
+                totalNetPl: summary.totalNetPl,
+                totalTrades: summary.totalTrades,
+            });
 
             if (
-                summary.profitFactor > bestProfitFactor ||
-                (summary.profitFactor === bestProfitFactor &&
+                pfScore(summary.profitFactor) > pfScore(bestProfitFactor) ||
+                (pfScore(summary.profitFactor) === pfScore(bestProfitFactor) &&
                     summary.totalNetPl > bestTrialResult.totalNetPl)
             ) {
                 bestValue = value;
@@ -138,7 +150,8 @@ export const runScalpingOptimization = async ({
             }
         }
 
-        const improved = bestProfitFactor > baseline.profitFactor;
+        const improved =
+            pfScore(bestProfitFactor) > pfScore(baseline.profitFactor);
         if (improved && bestValue !== currentValue) {
             (suggestedOverrides as Record<string, number>)[param] = bestValue;
         }
@@ -147,8 +160,8 @@ export const runScalpingOptimization = async ({
             param,
             currentValue,
             bestValue,
-            baselineProfitFactor: baseline.profitFactor,
-            bestProfitFactor,
+            baselineProfitFactor: pfScore(baseline.profitFactor),
+            bestProfitFactor: pfScore(bestProfitFactor),
             baselineWinRate: baseline.winRate,
             bestWinRate,
             improved,
