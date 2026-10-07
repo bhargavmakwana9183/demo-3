@@ -29,6 +29,10 @@ import {
 import { options } from 'joi';
 import { strategyController } from './strategy.controller';
 import sequelize from 'sequelize';
+import {
+    getTradeLegCounts,
+    getTradeLegsByTradeKey,
+} from '../helpers/nifty.scalp.leg.helper';
 const csv = require('csv-parser');
 
 class InstrumentsController {
@@ -979,8 +983,14 @@ class InstrumentsController {
             });
             const count = await db[MODEL.TRADE].count({ where });
 
+            const tradeKeys = data.flatMap((d) =>
+                [String(d.id), String(d.trade_id || '')].filter(Boolean),
+            );
+            const legCounts = await getTradeLegCounts(tradeKeys);
+
             const formated_data = data.map((datas) => ({
                 id: datas.trade_id,
+                tradeUuid: datas.id,
                 date: datas.createdAt,
                 symbol: datas.trading_symbol,
                 strategy_name: datas.strategy_name,
@@ -996,6 +1006,10 @@ class InstrumentsController {
                 target: datas.target_price,
                 exit_reason: datas.exit_reason,
                 status: datas.is_active ? 'Active' : 'Closed',
+                legCount:
+                    legCounts[String(datas.id)] ||
+                    legCounts[String(datas.trade_id)] ||
+                    0,
             }));
 
             return sendResponse(res, {
@@ -1007,6 +1021,32 @@ class InstrumentsController {
                     limit: req.paginations?.limit,
                 },
                 message: res.__('instruments').insert,
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    async trade_leg_history(req, res, next) {
+        try {
+            const tradeKey = String(
+                req.query?.trade_id ||
+                    req.query?.tradeId ||
+                    req.query?.id ||
+                    '',
+            ).trim();
+            if (!tradeKey) {
+                throw new AppError(
+                    'trade_id is required',
+                    ERRORTYPES.VALIDATION_ERROR,
+                );
+            }
+
+            const legs = await getTradeLegsByTradeKey(tradeKey);
+            return sendResponse(res, {
+                responseType: RES_STATUS.GET,
+                data: legs,
+                message: 'Trade leg history fetched',
             });
         } catch (error) {
             return next(error);
@@ -1040,8 +1080,14 @@ class InstrumentsController {
                 order: [['createdAt', 'DESC']],
             });
 
+            const tradeKeys = trades.flatMap((d) =>
+                [String(d.id), String(d.trade_id || '')].filter(Boolean),
+            );
+            const legCounts = await getTradeLegCounts(tradeKeys);
+
             const formated_data = trades.map((datas) => ({
                 id: datas.trade_id,
+                tradeUuid: datas.id,
                 entryDate: datas.createdAt,
                 symbol: datas.trading_symbol,
                 strategy_name: datas.strategy_name,
@@ -1059,6 +1105,10 @@ class InstrumentsController {
                 exit_reason: datas.exit_reason,
                 status: datas.is_active ? 'in_trade' : 'closed',
                 trade_time: datas.createdAt,
+                legCount:
+                    legCounts[String(datas.id)] ||
+                    legCounts[String(datas.trade_id)] ||
+                    0,
             }));
 
             return sendResponse(res, {

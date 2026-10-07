@@ -68,6 +68,7 @@ export enum MODEL {
     TRADE = 'tradeModel',
     UPSTOCK_ORDERS = 'UpstocksOrderModel',
     TRADE_UPDATE = 'tradeUpdateModel',
+    TRADE_LEG_HISTORY = 'tradeLegHistoryModel',
     STRATEGY_CONFIG = 'strategyConfigModel',
     STRATEGY_DAILY_STATS = 'strategyDailyStatsModel',
     DECISION_AUDIT = 'decisionAuditModel',

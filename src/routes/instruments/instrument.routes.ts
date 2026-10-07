@@ -76,6 +76,10 @@ class InstrumentRoutes extends BaseRoute {
             instrumentsController.trade_historylist,
         );
         this.router.get(
+            END_POINTS.TRADE_LEG_HISTORY,
+            instrumentsController.trade_leg_history,
+        );
+        this.router.get(
             END_POINTS.CURRENT_POSTIONS,
             paginationMiddleware,
             instrumentsController.current_postions,

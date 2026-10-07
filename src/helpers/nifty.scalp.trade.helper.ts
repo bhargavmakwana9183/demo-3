@@ -23,6 +23,7 @@ import {
     placeConfirmedUpstoxOrder,
     waitForOrderConfirmation,
 } from './nifty.scalp.order.helper';
+import { recordTradeLeg } from './nifty.scalp.leg.helper';
 
 let entryInProgress = false;
 
@@ -174,6 +175,26 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         broker_confirmed: true,
         exit_order_id: orderId || fresh.exit_order_id,
         last_order_error: null,
+    });
+
+    await recordTradeLeg({
+        trade: fresh,
+        legType: 'FULL_EXIT',
+        side: 'SELL',
+        lots: qty,
+        price: ltp,
+        reason: exitReason,
+        brokerOrderId: orderId || fresh.exit_order_id,
+        mode: isLiveTradingEnabled(await getTradingUser(), config)
+            ? 'live'
+            : 'paper',
+        grossPl,
+        netPl,
+        charges,
+        avgBuyAfter: avgBuy,
+        qtyAfter: 0,
+        targetAfter: Number(fresh.target_price || 0),
+        metadata: { exitReason },
     });
 
     const position = await db[MODEL.POSITION].findByPk(fresh.position_id);
@@ -370,6 +391,21 @@ export const openNiftyScalpEntry = async ({
             await updateNiftyStrategyBalance(-(fillPrice * lotSize));
         }
 
+        await recordTradeLeg({
+            trade,
+            legType: 'ENTRY',
+            side: 'BUY',
+            lots: 1,
+            price: fillPrice,
+            reason,
+            brokerOrderId: entryOrderId,
+            mode: liveMode ? 'live' : 'paper',
+            avgBuyAfter: fillPrice,
+            qtyAfter: 1,
+            targetAfter: target,
+            metadata: { signal, brokerConfirmed },
+        });
+
         await logNiftyAudit({
             action: 'ENTRY_FILLED',
             reason,
@@ -503,6 +539,20 @@ export const addNiftyScalpLot = async ({
     if (!liveMode) {
         await updateNiftyStrategyBalance(-(addPrice * lotSize));
     }
+
+    await recordTradeLeg({
+        trade,
+        legType: 'ADD_LOT',
+        side: 'BUY',
+        lots: 1,
+        price: addPrice,
+        reason: 'DRAWDOWN_10_POINTS',
+        mode: liveMode ? 'live' : 'paper',
+        avgBuyAfter: newAvg,
+        qtyAfter: newQty,
+        targetAfter: newTarget,
+        metadata: { oldAvg: avgBuy, oldQty: qty },
+    });
 
     await logNiftyAudit({
         action: 'ADD_LOT',
@@ -734,6 +784,23 @@ export const sellPartialNiftyLots = async ({
     } else {
         await updateNiftyStrategyBalance(partialNet);
     }
+
+    await recordTradeLeg({
+        trade,
+        legType: 'PARTIAL_SELL',
+        side: 'SELL',
+        lots: lotsToSell,
+        price: sellPrice,
+        reason,
+        mode: liveMode ? 'live' : 'paper',
+        grossPl: partialGross,
+        netPl: partialNet,
+        charges: partialCharges,
+        avgBuyAfter: avgBuy,
+        qtyAfter: remaining,
+        targetAfter: newTarget,
+        metadata: { lotsSold: lotsToSell, planB: true },
+    });
 
     await logNiftyAudit({
         action: 'PLAN_B_SCALP',
@@ -967,6 +1034,21 @@ export const manualOpenNiftyScalpEntry = async ({
                     : `Manual paper BUY ${qty} lot(s) @ ${fillPrice}. Engine will manage target/Plan B.`,
             },
             skipThrottle: true,
+        });
+
+        await recordTradeLeg({
+            trade,
+            legType: 'MANUAL_ENTRY',
+            side: 'BUY',
+            lots: qty,
+            price: fillPrice,
+            reason: 'MANUAL_FRONTEND_ENTRY',
+            brokerOrderId: entryOrderId,
+            mode: liveMode ? 'live' : 'paper',
+            avgBuyAfter: fillPrice,
+            qtyAfter: qty,
+            targetAfter: target,
+            metadata: { manual: true, referenceBuyPrice },
         });
 
         notifyNiftyEvent(

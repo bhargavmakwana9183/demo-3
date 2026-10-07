@@ -12,7 +12,9 @@
         "format:check": "prettier --check .",
         "format:write": "prettier --write .",
         "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
-        "lint:fix": "eslint . --ext .js,.jsx,.ts,.tsx --fix"
+        "lint:fix": "eslint . --ext .js,.jsx,.ts,.tsx --fix",
+        "seed:run": "sequelize-cli db:seed:all",
+        "migration:run:trade-leg-history": "sequelize-cli db:migrate --name create-trade-leg-history"
     },
     "dependencies": {
         "@types/jsonwebtoken": "^9.0.6",

@@ -33,6 +33,7 @@ export enum END_POINTS {
     CHECK_ORDER_PLACE = '/check-order-place-upstocks',
     STOCK_LIST = '/stock-list',
     TRADE_HISTORY_LIST = '/trade-history-list',
+    TRADE_LEG_HISTORY = '/trade-leg-history',
     CURRENT_POSTIONS = '/current-postions',
     DASHBOARD = '/dashboard-data',
     WEBHOOKS_TOKEN = '/upstock/webhooks/token',
