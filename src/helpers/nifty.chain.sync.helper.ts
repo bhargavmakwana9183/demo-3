@@ -44,6 +44,7 @@ export const syncNiftyOptionChain = async (): Promise<{
     let inserted = 0;
     let skipped = 0;
 
+    // Insert-only into option_chain_details — never delete chain / trade / position
     for (const data of contracts) {
         const existing = await db[MODEL.OPTIONS_CHAINS].findOne({
             where: { instrument_key: data.instrument_key },
@@ -59,26 +60,17 @@ export const syncNiftyOptionChain = async (): Promise<{
         inserted += 1;
     }
 
-    const today = moment().startOf('day').format('YYYY-MM-DD');
-    const deletedExpired = await db[MODEL.OPTIONS_CHAINS].destroy({
-        where: {
-            name: NIFTY_NAME,
-            expiry: { [Op.lt]: today },
-        },
-        force: true,
-    });
-
     await logNiftyAudit({
         action: 'CHAIN_SYNC',
-        reason: 'Nifty option_chain_details synced',
-        metadata: { inserted, skipped, deletedExpired },
+        reason: 'Nifty option_chain_details synced (insert only)',
+        metadata: { inserted, skipped, deletedExpired: 0 },
     });
 
     logger.info(
-        `Nifty option chain sync: inserted=${inserted}, skipped=${skipped}, deletedExpired=${deletedExpired}`,
+        `Nifty option chain sync: inserted=${inserted}, skipped=${skipped} (no chain/trade deletes)`,
     );
 
-    return { inserted, skipped, deletedExpired };
+    return { inserted, skipped, deletedExpired: 0 };
 };
 
 export const syncNiftyHedgingOptions = async (): Promise<{
@@ -135,10 +127,15 @@ export const syncNiftyHedgingOptions = async (): Promise<{
         inserted += 1;
     }
 
+    // Only purge hedging_options_details (never option_chain / trade / position)
+    const today = moment().startOf('day').format('YYYY-MM-DD');
     const deleted = await db[MODEL.HEDGING_OPTIONS].destroy({
         where: {
             name: NIFTY_NAME,
-            expiry: { [Op.ne]: expiry },
+            [Op.or]: [
+                { expiry: { [Op.ne]: expiry } },
+                { expiry: { [Op.lt]: today } },
+            ],
         },
         force: true,
     });
@@ -151,7 +148,7 @@ export const syncNiftyHedgingOptions = async (): Promise<{
     });
 
     logger.info(
-        `Nifty hedging sync expiry=${expiry}: inserted=${inserted}, skipped=${skipped}, deleted=${deleted}`,
+        `Nifty hedging sync expiry=${expiry}: inserted=${inserted}, skipped=${skipped}, deletedHedging=${deleted}`,
     );
 
     return { expiry, inserted, skipped, deleted };
