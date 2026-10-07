@@ -46,6 +46,8 @@ let apiVersion = '3.0';
 let OAUTH2 = defaultClient.authentications['OAUTH2'];
 let updateBuffer = {};
 let lastStrategyRunAt = 0;
+let lastPositionsEmitAt = 0;
+const POSITIONS_EMIT_THROTTLE_MS = 500;
 
 const port = process.env.PORT_SERVER || 8000;
 const stocks = new Map<string, any>();
@@ -75,7 +77,12 @@ class AppServer {
             logger.error(`ensureNiftyStrategyRecords: ${err.message}`),
         );
         this.io.on('connection', async (socket) => {
-            // socket.emit('stock_data', stocks_data);
+            // Immediate snapshot so Positions page has live LTP/P-L right away
+            try {
+                await this.emitTodayTrades();
+            } catch (err: any) {
+                logger.error(`emitTodayTrades on connect: ${err?.message || err}`);
+            }
             socket.on('sendemit', (data) => {
                 console.log(data);
                 this.io.emit('stock_data', data);
@@ -311,7 +318,12 @@ class AppServer {
                     await strategyController.nifty_options_scalp_run();
                 }
 
-                await this.emitTodayTrades();
+                // Push live LTP / P/L to Positions UI (throttled)
+                const emitNow = Date.now();
+                if (emitNow - lastPositionsEmitAt >= POSITIONS_EMIT_THROTTLE_MS) {
+                    lastPositionsEmitAt = emitNow;
+                    await this.emitTodayTrades();
+                }
             });
             ws.on('error', (error) => {
                 console.error('WebSocket error:', error);
@@ -335,25 +347,59 @@ class AppServer {
         });
 
         for (const datas of trades) {
+            const buyPrice = Number(datas.buy_price || 0);
+            const ltp = Number(datas.ltp || 0);
+            const sellPrice = Number(datas.sell_price || 0);
+            const lots = Number(datas.qty || 0);
+            const lotSize = Number(datas.lot_size || 0);
+            const qtyUnits = lotSize * lots;
+            const isActive = Boolean(datas.is_active);
+
+            // Live mark for open trades; closed uses stored sell
+            const markPrice = isActive
+                ? ltp
+                : sellPrice > 0
+                  ? sellPrice
+                  : ltp;
+            const grossPl =
+                buyPrice && markPrice && qtyUnits
+                    ? (markPrice - buyPrice) * qtyUnits
+                    : Number(datas.pl || 0);
+            const storedCharges = Number(datas.charges || 0);
+            // Open: estimate charges ~ ₹40/lot round-trip if not stored yet
+            const estCharges =
+                storedCharges > 0
+                    ? storedCharges
+                    : Math.max(0, lots) * 40 * 2;
+            const netPl = isActive
+                ? grossPl - estCharges
+                : Number(datas.net_pl ?? grossPl - storedCharges);
+
             formated_data.push({
                 id: datas.trade_id,
+                tradeUuid: datas.id,
                 entryDate: datas.createdAt,
                 symbol: datas.trading_symbol,
-                buyPrice: datas.buy_price,
-                sellPrice: datas.sell_price,
-                currentLTP: datas.ltp,
-                target: datas.target_price,
-                stopploss: datas.stop_loss,
-                profitLoss: datas.pl,
-                netPl: Number(datas.net_pl ?? datas.pl ?? 0),
-                charges: Number(datas.charges ?? 0),
-                quantity: Number(datas.lot_size) * Number(datas.qty),
-                status: datas.is_active ? 'in_trade' : 'closed',
+                buyPrice,
+                sellPrice: isActive ? null : sellPrice || null,
+                currentLTP: ltp,
+                markPrice,
+                target: Number(datas.target_price || 0),
+                stopploss: Number(datas.stop_loss || 0),
+                profitLoss: Number(grossPl.toFixed(2)),
+                netPl: Number(netPl.toFixed(2)),
+                charges: Number((isActive ? estCharges : storedCharges).toFixed(2)),
+                quantity: qtyUnits,
+                lots,
+                lot_size: lotSize,
+                status: isActive ? 'in_trade' : 'closed',
                 trade_time: datas.createdAt,
                 strategy_name: datas.strategy_name,
                 instrument_type: datas.instrument_type,
                 exit_reason: datas.exit_reason,
-                highest_ltp: Number(datas.highest_ltp ?? datas.ltp ?? 0),
+                highest_ltp: Number(datas.highest_ltp ?? ltp ?? 0),
+                live: true,
+                updatedAt: new Date().toISOString(),
             });
         }
 

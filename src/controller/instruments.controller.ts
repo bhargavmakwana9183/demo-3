@@ -1085,31 +1085,64 @@ class InstrumentsController {
             );
             const legCounts = await getTradeLegCounts(tradeKeys);
 
-            const formated_data = trades.map((datas) => ({
-                id: datas.trade_id,
-                tradeUuid: datas.id,
-                entryDate: datas.createdAt,
-                symbol: datas.trading_symbol,
-                strategy_name: datas.strategy_name,
-                instrument_type: datas.instrument_type,
-                buyPrice: datas.buy_price,
-                sellPrice: datas.sell_price,
-                currentLTP: datas.ltp,
-                target: datas.target_price,
-                stopploss: datas.stop_loss,
-                highest_ltp: Number(datas.highest_ltp ?? datas.ltp ?? 0),
-                profitLoss: datas.pl,
-                netPl: Number(datas.net_pl ?? datas.pl ?? 0),
-                charges: Number(datas.charges ?? 0),
-                quantity: Number(datas.lot_size) * Number(datas.qty),
-                exit_reason: datas.exit_reason,
-                status: datas.is_active ? 'in_trade' : 'closed',
-                trade_time: datas.createdAt,
-                legCount:
-                    legCounts[String(datas.id)] ||
-                    legCounts[String(datas.trade_id)] ||
-                    0,
-            }));
+            const formated_data = trades.map((datas) => {
+                const buyPrice = Number(datas.buy_price || 0);
+                const ltp = Number(datas.ltp || 0);
+                const sellPrice = Number(datas.sell_price || 0);
+                const lots = Number(datas.qty || 0);
+                const lotSize = Number(datas.lot_size || 0);
+                const qtyUnits = lotSize * lots;
+                const isActive = Boolean(datas.is_active);
+                const markPrice = isActive
+                    ? ltp
+                    : sellPrice > 0
+                      ? sellPrice
+                      : ltp;
+                const grossPl =
+                    buyPrice && markPrice && qtyUnits
+                        ? (markPrice - buyPrice) * qtyUnits
+                        : Number(datas.pl || 0);
+                const storedCharges = Number(datas.charges || 0);
+                const estCharges =
+                    storedCharges > 0
+                        ? storedCharges
+                        : Math.max(0, lots) * 40 * 2;
+                const netPl = isActive
+                    ? grossPl - estCharges
+                    : Number(datas.net_pl ?? grossPl - storedCharges);
+
+                return {
+                    id: datas.trade_id,
+                    tradeUuid: datas.id,
+                    entryDate: datas.createdAt,
+                    symbol: datas.trading_symbol,
+                    strategy_name: datas.strategy_name,
+                    instrument_type: datas.instrument_type,
+                    buyPrice,
+                    sellPrice: isActive ? null : sellPrice || null,
+                    currentLTP: ltp,
+                    markPrice,
+                    target: Number(datas.target_price || 0),
+                    stopploss: Number(datas.stop_loss || 0),
+                    highest_ltp: Number(datas.highest_ltp ?? ltp ?? 0),
+                    profitLoss: Number(grossPl.toFixed(2)),
+                    netPl: Number(netPl.toFixed(2)),
+                    charges: Number(
+                        (isActive ? estCharges : storedCharges).toFixed(2),
+                    ),
+                    quantity: qtyUnits,
+                    lots,
+                    lot_size: lotSize,
+                    exit_reason: datas.exit_reason,
+                    status: isActive ? 'in_trade' : 'closed',
+                    trade_time: datas.createdAt,
+                    live: isActive,
+                    legCount:
+                        legCounts[String(datas.id)] ||
+                        legCounts[String(datas.trade_id)] ||
+                        0,
+                };
+            });
 
             return sendResponse(res, {
                 responseType: RES_STATUS.GET,
