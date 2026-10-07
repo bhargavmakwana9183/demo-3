@@ -889,28 +889,32 @@ class InstrumentsController {
             // Nifty Options Scalp uses hedging_options_details as the live option universe
             if (isNifty) {
                 const where = { name: INDEXES_NAMES.NIFTY_50 };
+                const limit = Number(req.paginations?.limit) || 20;
+                const offset = Number(req.paginations?.offset) || 0;
+                const count = await db[MODEL.HEDGING_OPTIONS].count({ where });
+
+                // Highest LTP first, lowest last; null/0 LTP sink to bottom
                 const data = await db[MODEL.HEDGING_OPTIONS].findAll({
                     where,
-                    ...req.paginations,
+                    limit,
+                    offset,
                     order: [
                         [
-                            sequelize.literal(`CASE 
-                                WHEN instrument_type = 'CE' THEN 1 
-                                WHEN instrument_type = 'PE' THEN 2 
-                                ELSE 3 
-                            END ASC`),
+                            sequelize.literal(
+                                'COALESCE(ltp, 0) DESC NULLS LAST',
+                            ),
                         ],
+                        ['instrument_type', 'ASC'],
                         ['strike_price', 'ASC'],
                     ],
                 });
-                const count = await db[MODEL.HEDGING_OPTIONS].count({ where });
                 const formated = data.map((row) => ({
                     id: row.id,
                     name: row.name,
                     trading_symbol: row.trading_symbol,
                     instrument_type: row.instrument_type,
                     strike_price: row.strike_price,
-                    ltp: row.ltp,
+                    ltp: Number(row.ltp || 0),
                     lot_size: row.lot_size,
                     expiry: row.expiry,
                     instrument_key: row.instrument_key,
@@ -922,8 +926,8 @@ class InstrumentsController {
                     data: formated,
                     total: count,
                     paginations: {
-                        offset: req.paginations?.offset,
-                        limit: req.paginations?.limit,
+                        offset,
+                        limit,
                     },
                     message: res.__('instruments').insert,
                 });
