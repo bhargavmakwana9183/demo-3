@@ -51,4 +51,5 @@ export enum END_POINTS {
     NIFTY_SCALP_CONFIG = '/nifty-scalp/config',
     NIFTY_SCALP_TOGGLE_LIVE = '/nifty-scalp/toggle-live',
     NIFTY_SCALP_MANUAL_ENTRY = '/nifty-scalp/manual-entry',
+    NIFTY_SCALP_EOD_DECISION = '/nifty-scalp/eod-decision',
 }

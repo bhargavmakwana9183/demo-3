@@ -24,6 +24,10 @@ import { tryNiftyPlanB, recordNiftyPriceTick } from '../helpers/nifty.scalp.plan
 import { logNiftyAudit } from '../helpers/nifty.scalp.audit.helper';
 import { notifyNiftyEvent } from '../helpers/nifty.scalp.notify.helper';
 
+const NO_NEW_ENTRY_AFTER = '14:30';
+const EOD_CHECK_TIME = '15:10';
+const EOD_LOSS_CHOICE_RS = 500;
+
 export type NiftyEngineState =
     | 'INACTIVE'
     | 'MARKET_CLOSED'
@@ -227,6 +231,46 @@ export class NiftyScalpEngine {
             return 'SCANNING';
         }
 
+        const formattedDate = currentISTDate.toISOString().slice(0, 10);
+        const eodCheck = buildMarketTime(formattedDate, EOD_CHECK_TIME);
+        if (currentISTDate >= eodCheck && trade.eod_decision !== 'CARRY') {
+            // Green or flat: sell the rest. Add-lot and Plan B stay available before this.
+            if (netPl >= 0) {
+                await closeNiftyScalpTrade({
+                    trade,
+                    position,
+                    config,
+                    exitReason: 'EOD_1510_NOT_IN_LOSS',
+                });
+                return 'SCANNING';
+            }
+
+            // Loss of ₹500 or worse: ask carry vs manual sell. Do not auto-close.
+            if (netPl <= -EOD_LOSS_CHOICE_RS && trade.eod_decision !== 'REQUIRED') {
+                await trade.update({ eod_decision: 'REQUIRED' });
+                await logNiftyAudit({
+                    action: 'HOLD',
+                    reason: 'EOD_LOSS_CHOICE_REQUIRED',
+                    instrumentKey: trade.instrument_key,
+                    tradeId: trade.id,
+                    engineState: 'IN_TRADE',
+                    config,
+                    metadata: {
+                        netPl,
+                        threshold: -EOD_LOSS_CHOICE_RS,
+                        thinking:
+                            'After 15:10, loss is ₹500 or worse. Waiting for carry or manual sell.',
+                    },
+                    skipThrottle: true,
+                });
+                notifyNiftyEvent(
+                    'EOD_DECISION',
+                    `Loss ₹${Math.abs(netPl).toFixed(0)} after 3:10. Choose carry forward or manual sell.`,
+                    { tradeId: trade.id, netPl },
+                );
+            }
+        }
+
         // Averaging: -10 points from avg buy
         if (ltp <= avgBuy - config.add_lot_points) {
             const added = await addNiftyScalpLot({ trade, position, config });
@@ -244,6 +288,22 @@ export class NiftyScalpEngine {
         config: Awaited<ReturnType<typeof getNiftyScalpConfig>>,
         currentISTDate: Date,
     ): Promise<NiftyEngineState> {
+        const formattedDate = currentISTDate.toISOString().slice(0, 10);
+        const noNewAfter = buildMarketTime(formattedDate, NO_NEW_ENTRY_AFTER);
+        if (currentISTDate >= noNewAfter) {
+            await logNiftyAudit({
+                action: 'SKIP',
+                reason: 'AFTER_1430_NO_NEW_ENTRY',
+                engineState: 'SCANNING',
+                config,
+                metadata: {
+                    thinking:
+                        'After 14:30 with no open trade. Scan stopped. An open trade would still add, run Plan B, and watch the target.',
+                },
+            });
+            return 'SCANNING';
+        }
+
         const gate = await canOpenNewTrade(
             STRATEGY.NIFTY_OPTIONS_SCALP,
             config,

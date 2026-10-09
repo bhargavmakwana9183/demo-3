@@ -1141,6 +1141,7 @@ class InstrumentsController {
                     status: isActive ? 'in_trade' : 'closed',
                     trade_time: datas.createdAt,
                     live: isActive,
+                    eodDecision: datas.eod_decision || null,
                     legCount:
                         legCounts[String(datas.id)] ||
                         legCounts[String(datas.trade_id)] ||

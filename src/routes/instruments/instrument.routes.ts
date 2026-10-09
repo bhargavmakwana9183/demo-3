@@ -149,6 +149,10 @@ class InstrumentRoutes extends BaseRoute {
             END_POINTS.NIFTY_SCALP_MANUAL_ENTRY,
             strategyController.manual_nifty_scalp_entry,
         );
+        this.router.post(
+            END_POINTS.NIFTY_SCALP_EOD_DECISION,
+            strategyController.nifty_eod_decision,
+        );
 
         this.router.get(END_POINTS.DASHBOARD, instrumentsController.dashboard);
     }

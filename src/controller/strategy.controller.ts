@@ -41,7 +41,10 @@ import {
     syncNiftyHedgingOptions,
     syncNiftyOptionChain,
 } from '../helpers/nifty.chain.sync.helper';
-import { manualOpenNiftyScalpEntry } from '../helpers/nifty.scalp.trade.helper';
+import {
+    closeNiftyScalpTrade,
+    manualOpenNiftyScalpEntry,
+} from '../helpers/nifty.scalp.trade.helper';
 import { logger } from '../logger/logger';
 import { Op } from 'sequelize';
 import moment from 'moment';
@@ -1379,6 +1382,87 @@ class StrategyController {
                 message: result.liveMode
                     ? 'Manual Upstox BUY confirmed — engine will manage target / Plan B'
                     : 'Manual paper entry opened — engine will manage target / Plan B',
+            });
+        } catch (error) {
+            return next(error);
+        }
+    }
+
+    /** After 15:10 deep-loss prompt: carry overnight or sell the open trade. */
+    async nifty_eod_decision(req, res, next) {
+        try {
+            const tradeKey = String(
+                req.body?.trade_id || req.body?.tradeId || req.body?.id || '',
+            ).trim();
+            const action = String(req.body?.action || '')
+                .trim()
+                .toLowerCase();
+            if (!tradeKey) {
+                throw new AppError(
+                    'trade_id is required',
+                    ERRORTYPES.VALIDATION_ERROR,
+                );
+            }
+            if (action !== 'carry' && action !== 'sell') {
+                throw new AppError(
+                    'action must be carry or sell',
+                    ERRORTYPES.VALIDATION_ERROR,
+                );
+            }
+
+            const isUuid =
+                /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+                    tradeKey,
+                );
+            const trade = await db[MODEL.TRADE].findOne({
+                where: {
+                    is_active: true,
+                    strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP,
+                    ...(isUuid
+                        ? { id: tradeKey }
+                        : { trade_id: tradeKey }),
+                },
+            });
+            if (!trade) {
+                throw new AppError(
+                    'Open Nifty trade not found',
+                    ERRORTYPES.VALIDATION_ERROR,
+                );
+            }
+
+            if (action === 'carry') {
+                await trade.update({ eod_decision: 'CARRY' });
+                return res.status(200).json({
+                    status: RES_STATUS.UPDATE,
+                    data: { eodDecision: 'CARRY', tradeId: trade.trade_id },
+                    message: 'Trade will be carried forward',
+                });
+            }
+
+            const position = await db[MODEL.POSITION].findByPk(trade.position_id);
+            const config = await getNiftyScalpConfig();
+            const closed = await closeNiftyScalpTrade({
+                trade,
+                position,
+                config,
+                exitReason: 'MANUAL_EOD_SELL',
+            });
+            if (closed) {
+                await db[MODEL.TRADE].update(
+                    { eod_decision: 'MANUAL_SELL' },
+                    { where: { id: trade.id } },
+                );
+            }
+            return res.status(200).json({
+                status: RES_STATUS.UPDATE,
+                data: {
+                    eodDecision: closed ? 'MANUAL_SELL' : trade.eod_decision,
+                    closed: Boolean(closed),
+                    tradeId: trade.trade_id,
+                },
+                message: closed
+                    ? 'Manual sell sent. Trade closes after the fill is confirmed.'
+                    : 'Sell not confirmed yet. Trade stays open until Upstox fills.',
             });
         } catch (error) {
             return next(error);

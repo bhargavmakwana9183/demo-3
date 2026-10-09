@@ -133,6 +133,10 @@ export const tradeModel = (sequelize) => {
                 type: DataTypes.STRING,
                 allowNull: true,
             },
+            eod_decision: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
         },
         {
             paranoid: true,
