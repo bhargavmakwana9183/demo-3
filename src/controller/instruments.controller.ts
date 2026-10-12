@@ -1009,6 +1009,7 @@ class InstrumentsController {
                 stopplose: datas.stop_loss,
                 target: datas.target_price,
                 exit_reason: datas.exit_reason,
+                planBStarted: Boolean(datas.plan_b_started),
                 status: datas.is_active ? 'Active' : 'Closed',
                 legCount:
                     legCounts[String(datas.id)] ||
@@ -1142,6 +1143,7 @@ class InstrumentsController {
                     trade_time: datas.createdAt,
                     live: isActive,
                     eodDecision: datas.eod_decision || null,
+                    planBStarted: Boolean(datas.plan_b_started),
                     legCount:
                         legCounts[String(datas.id)] ||
                         legCounts[String(datas.trade_id)] ||

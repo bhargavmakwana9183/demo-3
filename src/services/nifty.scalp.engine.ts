@@ -13,6 +13,7 @@ import {
     getNiftyStrategyBalance,
     calculateGrossPl,
     calculateRoundTripCharges,
+    canAffordLot,
 } from '../helpers/nifty.scalp.config.helper';
 import { evaluateNiftyOptionSignal } from '../helpers/nifty.scalp.signal.helper';
 import {
@@ -20,7 +21,12 @@ import {
     closeNiftyScalpTrade,
     openNiftyScalpEntry,
 } from '../helpers/nifty.scalp.trade.helper';
-import { tryNiftyPlanB, recordNiftyPriceTick } from '../helpers/nifty.scalp.planb.helper';
+import {
+    manageNiftyPlanB,
+    planBOpenNet,
+    recordNiftyPriceTick,
+    startNiftyPlanB,
+} from '../helpers/nifty.scalp.planb.helper';
 import { logNiftyAudit } from '../helpers/nifty.scalp.audit.helper';
 import { notifyNiftyEvent } from '../helpers/nifty.scalp.notify.helper';
 
@@ -138,7 +144,9 @@ export class NiftyScalpEngine {
         const target = Number(trade.target_price);
         const grossPl = calculateGrossPl(ltp, avgBuy, qty, lotSize);
         const charges = calculateRoundTripCharges(qty, lotSize, avgBuy, config);
-        const netPl = grossPl - charges;
+        const netPl = trade.plan_b_started
+            ? planBOpenNet(trade, config)
+            : grossPl - charges;
 
         recordNiftyPriceTick(String(trade.id), ltp);
 
@@ -216,12 +224,19 @@ export class NiftyScalpEngine {
                 target,
                 netPl,
                 pointsFromAvg: Number((ltp - avgBuy).toFixed(2)),
-                thinking: `Holding ${qty} lot(s). LTP ${ltp}, avg ${avgBuy}, target ${target.toFixed(2)}, net≈${netPl.toFixed(2)}`,
+                planBStarted: Boolean(trade.plan_b_started),
+                thinking: trade.plan_b_started
+                    ? `Plan B is on. LTP ${ltp}, avg ${avgBuy}, ${qty} lot(s), net≈${netPl.toFixed(2)}`
+                    : `Holding ${qty} lot(s). LTP ${ltp}, avg ${avgBuy}, target ${target.toFixed(2)}, net≈${netPl.toFixed(2)}`,
             },
         });
 
-        // Target hit: charges + ₹200 net
-        if (ltp >= target && netPl >= config.target_profit_rs * 0.9) {
+        if (trade.plan_b_started) {
+            const cycle = await manageNiftyPlanB({ trade, position, config });
+            if (cycle === 'CLOSED') return 'SCANNING';
+            if (cycle === 'ACTED') return 'RECOVERY';
+        } else if (ltp >= target && netPl >= config.target_profit_rs * 0.9) {
+            // Target hit: charges + ₹200 net. Skipped once Plan B has started.
             await closeNiftyScalpTrade({
                 trade,
                 position,
@@ -271,15 +286,23 @@ export class NiftyScalpEngine {
             }
         }
 
-        // Averaging: -10 points from avg buy
-        if (ltp <= avgBuy - config.add_lot_points) {
+        // Averaging stays off after Plan B has started.
+        if (!trade.plan_b_started && ltp <= avgBuy - config.add_lot_points) {
+            const balance = await getNiftyStrategyBalance(config);
+            if (!canAffordLot(balance, ltp, lotSize) && config.enable_plan_b) {
+                await startNiftyPlanB({
+                    trade,
+                    position,
+                    config,
+                    balance,
+                    ltp,
+                    avgBuy,
+                });
+                return 'RECOVERY';
+            }
             const added = await addNiftyScalpLot({ trade, position, config });
             if (added) return 'AVERAGING';
         }
-
-        // Plan B recovery / opportunistic scalp
-        const planB = await tryNiftyPlanB({ trade, position, config });
-        if (planB) return 'RECOVERY';
 
         return 'IN_TRADE';
     }

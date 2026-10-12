@@ -137,6 +137,29 @@ export const tradeModel = (sequelize) => {
                 type: DataTypes.STRING,
                 allowNull: true,
             },
+            plan_b_started: {
+                type: DataTypes.BOOLEAN,
+                allowNull: false,
+                defaultValue: false,
+            },
+            plan_b_scalp_lots: {
+                type: DataTypes.FLOAT,
+                allowNull: false,
+                defaultValue: 0,
+            },
+            plan_b_last_sell_price: {
+                type: DataTypes.FLOAT,
+                allowNull: true,
+            },
+            plan_b_scalp_open: {
+                type: DataTypes.FLOAT,
+                allowNull: false,
+                defaultValue: 0,
+            },
+            plan_b_scalp_buy_price: {
+                type: DataTypes.FLOAT,
+                allowNull: true,
+            },
         },
         {
             paranoid: true,

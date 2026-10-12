@@ -9,6 +9,7 @@ export type TradeLegType =
     | 'MANUAL_ENTRY'
     | 'ADD_LOT'
     | 'PARTIAL_SELL'
+    | 'PLAN_B_REBUY'
     | 'FULL_EXIT';
 
 export type TradeLegSide = 'BUY' | 'SELL';

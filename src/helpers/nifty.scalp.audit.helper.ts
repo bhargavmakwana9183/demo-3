@@ -10,7 +10,10 @@ export type NiftyAuditAction =
     | 'SIGNAL_EVAL'
     | 'ADD_LOT'
     | 'CANNOT_ADD_LOT'
+    | 'PLAN_B_START'
+    | 'PLAN_B_REBUY'
     | 'PLAN_B_SCALP'
+    | 'PLAN_B_MAX_LOSS'
     | 'TARGET_HIT'
     | 'CARRY_FORWARD'
     | 'LIVE_ORDER_FAIL'
@@ -40,7 +43,9 @@ export const logNiftyAudit = async (input: {
         'TARGET_HIT',
         'ADD_LOT',
         'CANNOT_ADD_LOT',
+        'PLAN_B_START',
         'PLAN_B_SCALP',
+        'PLAN_B_MAX_LOSS',
         'LIVE_ORDER_FAIL',
         'CARRY_FORWARD',
         'CHAIN_SYNC',

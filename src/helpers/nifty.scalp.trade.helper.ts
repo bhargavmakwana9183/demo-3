@@ -830,6 +830,254 @@ export const sellPartialNiftyLots = async ({
     return true;
 };
 
+const chargesCoverConfig = (config: NiftyScalpConfig): NiftyScalpConfig => ({
+    ...config,
+    target_profit_rs: 0,
+});
+
+/** Buy back the Plan B scalp quantity after a 5-point drop. Core average stays put. */
+export const buyNiftyPlanBScalp = async ({
+    trade,
+    position,
+    config,
+}: {
+    trade: any;
+    position: any;
+    config: NiftyScalpConfig;
+}) => {
+    if (trade.exit_pending || trade.exit_halted) return false;
+    if (Number(trade.plan_b_scalp_open || 0) > 0) return false;
+
+    const ltp = Number(trade.ltp);
+    const lotSize = Number(trade.lot_size);
+    const want = Math.floor(Number(trade.plan_b_scalp_lots || 0));
+    if (want < 1 || ltp <= 0 || lotSize <= 0) return false;
+
+    const balance = await getNiftyStrategyBalance(config);
+    const lotCost = ltp * lotSize;
+    const affordable = Math.floor(balance / lotCost);
+    const lots = Math.min(want, affordable);
+    if (lots < 1) {
+        await logNiftyAudit({
+            action: 'PLAN_B_REBUY',
+            reason: 'INSUFFICIENT_BALANCE_PLAN_B_REBUY',
+            instrumentKey: trade.instrument_key,
+            tradeId: trade.id,
+            engineState: 'RECOVERY',
+            config,
+            metadata: {
+                ltp,
+                want,
+                balance,
+                required: lotCost,
+                thinking: 'Plan B wanted to buy the sold quantity. Balance cannot pay.',
+            },
+        });
+        return false;
+    }
+
+    const user = await getTradingUser();
+    const liveMode = isLiveTradingEnabled(user, config);
+    let buyPrice = ltp;
+
+    if (liveMode) {
+        const live = await placeConfirmedUpstoxOrder({
+            user,
+            config,
+            instrumentKey: trade.instrument_key,
+            quantity: lotSize * lots,
+            side: 'BUY',
+            purpose: 'ADD_LOT',
+            positionId: position.id,
+            tradeId: trade.id,
+        });
+        if (!live.ok) return false;
+        buyPrice = Number(live.averagePrice || ltp);
+    }
+
+    const qty = Number(trade.qty);
+    const newQty = qty + lots;
+    const coreAvg = Number(trade.buy_price);
+
+    await trade.update({
+        qty: newQty,
+        original_qty: newQty,
+        ltp: buyPrice,
+        plan_b_scalp_open: lots,
+        plan_b_scalp_buy_price: buyPrice,
+        broker_confirmed: true,
+    });
+    await position.update({ qty: newQty });
+
+    if (!liveMode) {
+        await updateNiftyStrategyBalance(-(buyPrice * lotSize * lots));
+    }
+
+    await recordTradeLeg({
+        trade,
+        legType: 'PLAN_B_REBUY',
+        side: 'BUY',
+        lots,
+        price: buyPrice,
+        reason: 'PLAN_B_DROP_5',
+        mode: liveMode ? 'live' : 'paper',
+        avgBuyAfter: coreAvg,
+        qtyAfter: newQty,
+        metadata: { scalpBuy: buyPrice, coreAvg, want },
+    });
+
+    await logNiftyAudit({
+        action: 'PLAN_B_REBUY',
+        reason: 'PLAN_B_DROP_5',
+        instrumentKey: trade.instrument_key,
+        tradeId: trade.id,
+        engineState: 'RECOVERY',
+        config,
+        metadata: {
+            lots,
+            buyPrice,
+            coreAvg,
+            newQty,
+            liveMode,
+            thinking: `Plan B bought ${lots} lot(s) @ ${buyPrice}. Core average stays ${coreAvg}.`,
+        },
+        skipThrottle: true,
+    });
+
+    notifyNiftyEvent(
+        'PLAN_B_REBUY',
+        `Plan B bought ${lots} lot(s) @ ${buyPrice}`,
+        { lots, buyPrice, coreAvg },
+    );
+
+    return true;
+};
+
+/**
+ * Sell the open Plan B scalp lots after a 3-point bounce.
+ * Net profit is subtracted from the kept lot's cost so its average falls.
+ */
+export const sellNiftyPlanBBounce = async ({
+    trade,
+    position,
+    config,
+}: {
+    trade: any;
+    position: any;
+    config: NiftyScalpConfig;
+}) => {
+    if (trade.exit_pending || trade.exit_halted) return false;
+
+    const qty = Number(trade.qty);
+    const lots = Math.floor(Number(trade.plan_b_scalp_open || 0));
+    const scalpBuy = Number(trade.plan_b_scalp_buy_price || 0);
+    if (lots < 1 || lots >= qty || scalpBuy <= 0) return false;
+
+    const ltp = Number(trade.ltp);
+    const lotSize = Number(trade.lot_size);
+    const user = await getTradingUser();
+    const liveMode = isLiveTradingEnabled(user, config);
+    let sellPrice = ltp;
+
+    if (liveMode) {
+        const live = await placeConfirmedUpstoxOrder({
+            user,
+            config,
+            instrumentKey: trade.instrument_key,
+            quantity: lotSize * lots,
+            side: 'SELL',
+            purpose: 'PARTIAL_EXIT',
+            positionId: position.id,
+            tradeId: trade.id,
+        });
+        if (!live.ok) return false;
+        sellPrice = Number(live.averagePrice || ltp);
+    }
+
+    const partialGross = (sellPrice - scalpBuy) * lotSize * lots;
+    const partialCharges = calculateRoundTripCharges(
+        lots,
+        lotSize,
+        scalpBuy,
+        config,
+    );
+    const partialNet = partialGross - partialCharges;
+    const coreQty = qty - lots;
+    const coreAvg = Number(trade.buy_price);
+    const coreCost = coreAvg * lotSize * coreQty;
+    const newAvg = (coreCost - partialNet) / (lotSize * coreQty);
+    const cover = chargesCoverConfig(config);
+    const newTarget = calculateTargetLtp(newAvg, coreQty, lotSize, cover);
+
+    await trade.update({
+        qty: coreQty,
+        original_qty: coreQty,
+        buy_price: newAvg,
+        pl: Number(trade.pl || 0) + partialNet,
+        target_price: newTarget,
+        ltp: sellPrice,
+        plan_b_scalp_open: 0,
+        plan_b_scalp_buy_price: null,
+        plan_b_last_sell_price: sellPrice,
+    });
+    await position.update({
+        qty: coreQty,
+        required_margin: newAvg * lotSize * coreQty,
+    });
+
+    if (!liveMode) {
+        await updateNiftyStrategyBalance(sellPrice * lotSize * lots);
+    } else {
+        await updateNiftyStrategyBalance(partialNet);
+    }
+
+    await recordTradeLeg({
+        trade,
+        legType: 'PARTIAL_SELL',
+        side: 'SELL',
+        lots,
+        price: sellPrice,
+        reason: 'PLAN_B_BOUNCE_3',
+        mode: liveMode ? 'live' : 'paper',
+        grossPl: partialGross,
+        netPl: partialNet,
+        charges: partialCharges,
+        avgBuyAfter: newAvg,
+        qtyAfter: coreQty,
+        targetAfter: newTarget,
+        metadata: { scalpBuy, oldAvg: coreAvg, partialNet },
+    });
+
+    await logNiftyAudit({
+        action: 'PLAN_B_SCALP',
+        reason: 'PLAN_B_BOUNCE_3',
+        instrumentKey: trade.instrument_key,
+        tradeId: trade.id,
+        engineState: 'RECOVERY',
+        config,
+        metadata: {
+            lots,
+            sellPrice,
+            scalpBuy,
+            partialNet,
+            oldAvg: coreAvg,
+            newAvg,
+            newTarget,
+            liveMode,
+            thinking: `Bounce sell ${lots} lot(s). Core average ${coreAvg.toFixed(2)} → ${newAvg.toFixed(2)}.`,
+        },
+        skipThrottle: true,
+    });
+
+    notifyNiftyEvent(
+        'PLAN_B_SCALP',
+        `Plan B sold ${lots} lot(s) @ ${sellPrice}. Average now ${newAvg.toFixed(2)}`,
+        { lots, sellPrice, newAvg, partialNet },
+    );
+
+    return true;
+};
+
 /**
  * Manual / test entry from frontend.
  * Places Upstox BUY (when production) with confirmation, then opens a

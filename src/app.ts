@@ -399,6 +399,7 @@ class AppServer {
                 exit_reason: datas.exit_reason,
                 highest_ltp: Number(datas.highest_ltp ?? ltp ?? 0),
                 eodDecision: datas.eod_decision || null,
+                planBStarted: Boolean(datas.plan_b_started),
                 live: true,
                 updatedAt: new Date().toISOString(),
             });
