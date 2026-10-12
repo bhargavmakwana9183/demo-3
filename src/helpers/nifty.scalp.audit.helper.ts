@@ -80,23 +80,42 @@ export const logNiftyAudit = async (input: {
 export const getNiftyAuditLogs = async ({
     days = 7,
     action,
-    limit = 100,
+    pageIndex = 1,
+    pageSize = 20,
 }: {
     days?: number;
     action?: string;
-    limit?: number;
+    pageIndex?: number;
+    pageSize?: number;
 }) => {
+    const safeDays = Number.isFinite(days) && days > 0 ? days : 7;
     const since = new Date();
-    since.setDate(since.getDate() - days);
+    since.setDate(since.getDate() - safeDays);
     const where: Record<string, unknown> = {
         strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP,
         timestamp: { [Op.gte]: since },
     };
     if (action) where.action = action;
 
-    return db[MODEL.DECISION_AUDIT].findAll({
+    const safeSize = Math.min(100, Math.max(1, Math.floor(pageSize) || 20));
+    const requestedPage = Math.max(1, Math.floor(pageIndex) || 1);
+
+    const total = await db[MODEL.DECISION_AUDIT].count({ where });
+    const totalPages = Math.max(1, Math.ceil(total / safeSize));
+    const safePage = Math.min(requestedPage, totalPages);
+
+    const logs = await db[MODEL.DECISION_AUDIT].findAll({
         where,
         order: [['timestamp', 'DESC']],
-        limit: Math.min(limit, 500),
+        limit: safeSize,
+        offset: (safePage - 1) * safeSize,
     });
+
+    return {
+        logs,
+        total,
+        pageIndex: safePage,
+        pageSize: safeSize,
+        totalPages,
+    };
 };

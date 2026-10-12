@@ -1197,11 +1197,27 @@ class StrategyController {
         try {
             const days = Number(req.query?.days ?? 7);
             const action = req.query?.action as string | undefined;
-            const limit = Math.min(Number(req.query?.limit ?? 100), 500);
-            const logs = await getNiftyAuditLogs({ days, action, limit });
+            const pageIndex = Number(
+                req.query?.pageIndex ?? req.query?.page ?? 1,
+            );
+            const pageSize = Number(
+                req.query?.pageSize ?? req.query?.limit ?? 20,
+            );
+            const [page, skipBreakdown] = await Promise.all([
+                getNiftyAuditLogs({
+                    days,
+                    action: action || undefined,
+                    pageIndex,
+                    pageSize,
+                }),
+                getAuditSkipBreakdown(
+                    STRATEGY.NIFTY_OPTIONS_SCALP,
+                    Number.isFinite(days) ? days : 7,
+                ),
+            ]);
             return res.status(200).json({
                 status: RES_STATUS.GET,
-                data: { logs },
+                data: { ...page, skipBreakdown },
                 message: 'Nifty scalp audit logs fetched',
             });
         } catch (error) {
