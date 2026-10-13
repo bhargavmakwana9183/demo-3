@@ -31,6 +31,7 @@ import { logNiftyAudit } from '../helpers/nifty.scalp.audit.helper';
 import { notifyNiftyEvent } from '../helpers/nifty.scalp.notify.helper';
 
 const NO_NEW_ENTRY_AFTER = '14:30';
+const EXPIRY_NO_NEW_ENTRY_AFTER = '11:30';
 const EOD_CHECK_TIME = '15:10';
 const EOD_LOSS_CHOICE_RS = 500;
 
@@ -312,6 +313,27 @@ export class NiftyScalpEngine {
         currentISTDate: Date,
     ): Promise<NiftyEngineState> {
         const formattedDate = currentISTDate.toISOString().slice(0, 10);
+        const expiry = await get_upcoming_expiry_date(INDEXES_NAMES.NIFTY_50);
+        const expiryDay = expiry ? moment(expiry).format('YYYY-MM-DD') : '';
+        const expiryCutoff = buildMarketTime(
+            formattedDate,
+            EXPIRY_NO_NEW_ENTRY_AFTER,
+        );
+        if (expiryDay === formattedDate && currentISTDate >= expiryCutoff) {
+            await logNiftyAudit({
+                action: 'SKIP',
+                reason: 'EXPIRY_DAY_AFTER_1130_NO_NEW_ENTRY',
+                engineState: 'SCANNING',
+                config,
+                metadata: {
+                    expiry: expiryDay,
+                    thinking:
+                        'Expiry day after 11:30. No new trade. A trade opened before 11:30 is still monitored for target, add-lot, and Plan B.',
+                },
+            });
+            return 'SCANNING';
+        }
+
         const noNewAfter = buildMarketTime(formattedDate, NO_NEW_ENTRY_AFTER);
         if (currentISTDate >= noNewAfter) {
             await logNiftyAudit({
@@ -342,7 +364,6 @@ export class NiftyScalpEngine {
             return 'SCANNING';
         }
 
-        const expiry = await get_upcoming_expiry_date(INDEXES_NAMES.NIFTY_50);
         if (!expiry) {
             await logNiftyAudit({
                 action: 'SKIP',
