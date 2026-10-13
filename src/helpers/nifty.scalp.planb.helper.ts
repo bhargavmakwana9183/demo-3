@@ -1,7 +1,6 @@
 import {
     NiftyScalpConfig,
     calculateRoundTripCharges,
-    calculateTargetLtp,
 } from './nifty.scalp.config.helper';
 import { logNiftyAudit } from './nifty.scalp.audit.helper';
 import { notifyNiftyEvent } from './nifty.scalp.notify.helper';
@@ -15,11 +14,6 @@ import {
 const REBUY_DROP_POINTS = 5;
 const BOUNCE_SELL_POINTS = 3;
 const MAX_LOSS_RS = 8000;
-
-const chargesCoverConfig = (config: NiftyScalpConfig): NiftyScalpConfig => ({
-    ...config,
-    target_profit_rs: 0,
-});
 
 type TickPoint = { ltp: number; at: number };
 
@@ -61,17 +55,27 @@ export const planBOpenNet = (trade: any, config: NiftyScalpConfig): number => {
 const planBTotal = (trade: any, config: NiftyScalpConfig) =>
     Number(trade.pl || 0) + planBOpenNet(trade, config);
 
+/**
+ * Target on the kept lot: near the average, charges covered, and the booked
+ * Plan B loss earned back. Bounce profits already in trade.pl lower this price.
+ */
 const applyChargesCoverTarget = async (trade: any, config: NiftyScalpConfig) => {
     const avg = Number(trade.buy_price);
-    const qty = Number(trade.qty);
+    const qty = Math.max(Number(trade.qty) - Number(trade.plan_b_scalp_open || 0), 1);
     const lotSize = Number(trade.lot_size);
-    const target = calculateTargetLtp(
-        avg,
-        Math.max(qty, 1),
-        lotSize,
-        chargesCoverConfig(config),
-    );
+    const booked = Number(trade.pl || 0);
+    const charges = calculateRoundTripCharges(qty, lotSize, avg, config);
+    const needGross = Math.max(charges, charges - booked);
+    const target = avg + needGross / (lotSize * qty);
     await trade.update({ target_price: target });
+};
+
+/** Last lot is near its average, its charges are covered, and booked loss is recovered. */
+const planBRecoveryExitReady = (trade: any, config: NiftyScalpConfig) => {
+    if (Number(trade.plan_b_scalp_open || 0) > 0) return false;
+    const openNet = planBOpenNet(trade, config);
+    const total = Number(trade.pl || 0) + openNet;
+    return openNet >= 0 && total >= 0;
 };
 
 /**
@@ -265,25 +269,25 @@ export const manageNiftyPlanB = async ({
     if (scalpOpen > 0 && ltp >= Number(trade.plan_b_scalp_buy_price) + BOUNCE_SELL_POINTS) {
         const sold = await sellNiftyPlanBBounce({ trade, position, config });
         if (!sold) return 'HOLD';
-        const openNet = planBOpenNet(trade, config);
-        if (Number(trade.plan_b_scalp_open || 0) <= 0 && openNet >= 0) {
+        if (planBRecoveryExitReady(trade, config)) {
             const closed = await closeNiftyScalpTrade({
                 trade,
                 position,
                 config,
-                exitReason: 'PLAN_B_CHARGES_COVER',
+                exitReason: 'PLAN_B_LOSS_AND_CHARGES_COVER',
             });
             return closed ? 'CLOSED' : 'ACTED';
         }
+        await applyChargesCoverTarget(trade, config);
         return 'ACTED';
     }
 
-    if (scalpOpen <= 0 && planBOpenNet(trade, config) >= 0) {
+    if (planBRecoveryExitReady(trade, config)) {
         const closed = await closeNiftyScalpTrade({
             trade,
             position,
             config,
-            exitReason: 'PLAN_B_CHARGES_COVER',
+            exitReason: 'PLAN_B_LOSS_AND_CHARGES_COVER',
         });
         return closed ? 'CLOSED' : 'HOLD';
     }

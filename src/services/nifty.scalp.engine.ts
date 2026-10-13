@@ -146,7 +146,7 @@ export class NiftyScalpEngine {
         const grossPl = calculateGrossPl(ltp, avgBuy, qty, lotSize);
         const charges = calculateRoundTripCharges(qty, lotSize, avgBuy, config);
         const netPl = trade.plan_b_started
-            ? planBOpenNet(trade, config)
+            ? Number(trade.pl || 0) + planBOpenNet(trade, config)
             : grossPl - charges;
 
         recordNiftyPriceTick(String(trade.id), ltp);
