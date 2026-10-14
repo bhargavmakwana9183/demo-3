@@ -329,11 +329,22 @@ export const handleNiftyOrderStatusUpdate = async (orderData: any) => {
 
     if (isOrderFilled(status)) {
         if (purpose === 'ENTRY' || purpose === 'ADD_LOT') {
+            // ADD_LOT fill price is one lot, not the position average.
+            // addNiftyScalpLot already stored the blended buy_price.
+            // A late portfolio update must not replace 139.63 with 134.70.
+            const keepAverage =
+                purpose === 'ADD_LOT' || Number(trade.qty) > 1;
             await trade.update({
                 broker_confirmed: true,
                 order_lifecycle: 'OPEN',
-                buy_price:
-                    averagePrice > 0 ? averagePrice : trade.buy_price,
+                ...(keepAverage
+                    ? {}
+                    : {
+                          buy_price:
+                              averagePrice > 0
+                                  ? averagePrice
+                                  : trade.buy_price,
+                      }),
                 last_order_error: null,
             });
             if (purpose === 'ENTRY') {
