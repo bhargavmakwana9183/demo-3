@@ -113,6 +113,22 @@ export const calculateGrossPl = (
     return (ltp - avgBuy) * lotSize * qty;
 };
 
+export const NIFTY_ADD_POINTS = 5;
+export const NIFTY_MAX_LOTS = 3;
+export const NIFTY_STOP_POINTS = 3;
+
+/** Premium reserved before entry: lot at P, at P-5, then at the new average minus 5. */
+export const threeLotDownPathCost = (
+    price: number,
+    lotSize: number,
+): number | null => {
+    if (!(price > NIFTY_ADD_POINTS) || !(lotSize > 0)) return null;
+    const second = price - NIFTY_ADD_POINTS;
+    const third = (price + second) / 2 - NIFTY_ADD_POINTS;
+    if (second <= 0 || third <= 0) return null;
+    return (price + second + third) * lotSize;
+};
+
 export const canAffordLot = (
     balance: number,
     ltp: number,
@@ -132,6 +148,15 @@ export const getNiftyStrategyBalance = async (
         return Number(strategy.strategy_balance);
     }
     return Number(config.paper_balance);
+};
+
+export const setNiftyStrategyBalance = async (amount: number) => {
+    if (!Number.isFinite(amount)) return;
+    const strategy = await db[MODEL.STRATEGY].findOne({
+        where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP },
+    });
+    if (!strategy) return;
+    await strategy.update({ strategy_balance: amount });
 };
 
 export const updateNiftyStrategyBalance = async (delta: number) => {

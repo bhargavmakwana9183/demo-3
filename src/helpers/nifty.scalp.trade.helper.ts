@@ -4,6 +4,9 @@ import { db } from '../model';
 import { logger } from '../logger/logger';
 import { isLiveTradingEnabled } from './scalping.trade.helper';
 import {
+    NIFTY_ADD_POINTS,
+    NIFTY_MAX_LOTS,
+    NIFTY_STOP_POINTS,
     NiftyScalpConfig,
     calculateGrossPl,
     calculateRoundTripCharges,
@@ -11,6 +14,8 @@ import {
     canAffordLot,
     getNiftyScalpConfig,
     getNiftyStrategyBalance,
+    setNiftyStrategyBalance,
+    threeLotDownPathCost,
     updateNiftyStrategyBalance,
 } from './nifty.scalp.config.helper';
 import { logNiftyAudit } from './nifty.scalp.audit.helper';
@@ -24,6 +29,7 @@ import {
     waitForOrderConfirmation,
 } from './nifty.scalp.order.helper';
 import { recordTradeLeg } from './nifty.scalp.leg.helper';
+import { get_upstox_funds_and_margin } from './upstocks.apis';
 
 let entryInProgress = false;
 
@@ -89,6 +95,19 @@ export const processNiftyMarketFeed = async (stocks_data: any) => {
             );
         }
     }
+};
+
+/** After a confirmed live fill, store Upstox equity available_margin. */
+export const syncStrategyBalanceFromUpstox = async () => {
+    const user = await getTradingUser();
+    if (!user?.token) return null;
+    const available = await get_upstox_funds_and_margin(user.token);
+    if (available == null) {
+        logger.warn('Upstox funds sync skipped — no available_margin');
+        return null;
+    }
+    await setNiftyStrategyBalance(available);
+    return available;
 };
 
 const getTradingUser = async () =>
@@ -210,7 +229,7 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
     if (!isLiveTradingEnabled(user, config)) {
         await updateNiftyStrategyBalance(ltp * lotSize * qty);
     } else {
-        await updateNiftyStrategyBalance(netPl);
+        await syncStrategyBalanceFromUpstox();
     }
 
     await logNiftyAudit({
@@ -280,20 +299,21 @@ export const openNiftyScalpEntry = async ({
         }
 
         const balance = await getNiftyStrategyBalance(config);
-        if (!canAffordLot(balance, quoteLtp, lotSize)) {
+        const reserved = threeLotDownPathCost(quoteLtp, lotSize);
+        if (reserved == null || balance < reserved) {
             await logNiftyAudit({
                 action: 'SKIP',
-                reason: 'INSUFFICIENT_BALANCE_ENTRY',
+                reason: 'INSUFFICIENT_BALANCE_3_LOT',
                 signal,
                 instrumentKey: option.instrument_key,
                 config,
                 indicators,
-                metadata: { balance, required: quoteLtp * lotSize },
+                metadata: { balance, required: reserved, quoteLtp, lotSize },
             });
             notifyNiftyEvent(
                 'CANNOT_ADD_LOT',
-                'Not enough balance to open first lot',
-                { balance, required: quoteLtp * lotSize },
+                'Balance cannot cover 3 lots if price falls 5 points twice',
+                { balance, required: reserved },
             );
             return null;
         }
@@ -365,7 +385,7 @@ export const openNiftyScalpEntry = async ({
             trade_type: 'BUY',
             buy_price: fillPrice,
             target_price: target,
-            stop_loss: fillPrice - config.add_lot_points,
+            stop_loss: 0,
             is_active: true,
             ltp: fillPrice,
             qty: 1,
@@ -389,6 +409,8 @@ export const openNiftyScalpEntry = async ({
 
         if (!liveMode) {
             await updateNiftyStrategyBalance(-(fillPrice * lotSize));
+        } else {
+            await syncStrategyBalanceFromUpstox();
         }
 
         await recordTradeLeg({
@@ -470,7 +492,8 @@ export const addNiftyScalpLot = async ({
     const avgBuy = Number(trade.buy_price);
     const qty = Number(trade.qty);
 
-    if (ltp > avgBuy - config.add_lot_points) return false;
+    if (qty >= NIFTY_MAX_LOTS) return false;
+    if (ltp > avgBuy - NIFTY_ADD_POINTS) return false;
 
     const balance = await getNiftyStrategyBalance(config);
     if (!canAffordLot(balance, ltp, lotSize)) {
@@ -522,11 +545,14 @@ export const addNiftyScalpLot = async ({
     const newAvg = (avgBuy * qty + addPrice) / newQty;
     const newTarget = calculateTargetLtp(newAvg, newQty, lotSize, config);
 
+    const stopLoss =
+        newQty >= NIFTY_MAX_LOTS ? addPrice - NIFTY_STOP_POINTS : 0;
+
     await trade.update({
         qty: newQty,
         buy_price: newAvg,
         target_price: newTarget,
-        stop_loss: newAvg - config.add_lot_points,
+        stop_loss: stopLoss,
         original_qty: newQty,
         ltp: addPrice,
         broker_confirmed: true,
@@ -538,6 +564,8 @@ export const addNiftyScalpLot = async ({
 
     if (!liveMode) {
         await updateNiftyStrategyBalance(-(addPrice * lotSize));
+    } else {
+        await syncStrategyBalanceFromUpstox();
     }
 
     await recordTradeLeg({
@@ -546,7 +574,7 @@ export const addNiftyScalpLot = async ({
         side: 'BUY',
         lots: 1,
         price: addPrice,
-        reason: 'DRAWDOWN_10_POINTS',
+        reason: 'DRAWDOWN_5_POINTS',
         mode: liveMode ? 'live' : 'paper',
         avgBuyAfter: newAvg,
         qtyAfter: newQty,
@@ -556,7 +584,7 @@ export const addNiftyScalpLot = async ({
 
     await logNiftyAudit({
         action: 'ADD_LOT',
-        reason: 'DRAWDOWN_10_POINTS',
+        reason: 'DRAWDOWN_5_POINTS',
         instrumentKey: trade.instrument_key,
         tradeId: trade.id,
         engineState: 'AVERAGING',
@@ -1109,7 +1137,7 @@ export const manualOpenNiftyScalpEntry = async ({
 
     try {
         const config = await getNiftyScalpConfig();
-        const qty = Math.max(1, Math.min(Number(lots) || 1, 20));
+        const qty = Math.max(1, Math.min(Number(lots) || 1, 1));
 
         const existing = await db[MODEL.POSITION].findOne({
             where: {
@@ -1149,14 +1177,12 @@ export const manualOpenNiftyScalpEntry = async ({
                 : 'CE_BUY';
 
         const balance = await getNiftyStrategyBalance(config);
-        const required = quoteLtp * lotSize * qty;
-        if (!isLiveTradingEnabled(await getTradingUser(), config)) {
-            if (balance < required) {
-                return {
-                    ok: false,
-                    error: `INSUFFICIENT_PAPER_BALANCE need ₹${required.toFixed(0)} have ₹${balance.toFixed(0)}`,
-                };
-            }
+        const required = threeLotDownPathCost(quoteLtp, lotSize);
+        if (required == null || balance < required) {
+            return {
+                ok: false,
+                error: `INSUFFICIENT_BALANCE_3_LOT need ₹${Number(required || 0).toFixed(0)} have ₹${balance.toFixed(0)}`,
+            };
         }
 
         const user = await getTradingUser();
@@ -1232,7 +1258,7 @@ export const manualOpenNiftyScalpEntry = async ({
             trade_type: 'BUY',
             buy_price: fillPrice,
             target_price: target,
-            stop_loss: fillPrice - config.add_lot_points,
+            stop_loss: qty >= NIFTY_MAX_LOTS ? fillPrice - NIFTY_STOP_POINTS : 0,
             is_active: true,
             ltp: fillPrice,
             qty,
@@ -1256,6 +1282,8 @@ export const manualOpenNiftyScalpEntry = async ({
 
         if (!liveMode) {
             await updateNiftyStrategyBalance(-(fillPrice * lotSize * qty));
+        } else {
+            await syncStrategyBalanceFromUpstox();
         }
 
         await logNiftyAudit({

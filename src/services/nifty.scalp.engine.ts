@@ -9,11 +9,12 @@ import {
 } from '../helpers/stock.helper';
 import { buildMarketTime, canOpenNewTrade } from '../helpers/scalping.risk.helper';
 import {
+    NIFTY_ADD_POINTS,
+    NIFTY_MAX_LOTS,
     getNiftyScalpConfig,
     getNiftyStrategyBalance,
     calculateGrossPl,
     calculateRoundTripCharges,
-    canAffordLot,
 } from '../helpers/nifty.scalp.config.helper';
 import { evaluateNiftyOptionSignal } from '../helpers/nifty.scalp.signal.helper';
 import {
@@ -25,7 +26,6 @@ import {
     manageNiftyPlanB,
     planBOpenNet,
     recordNiftyPriceTick,
-    startNiftyPlanB,
 } from '../helpers/nifty.scalp.planb.helper';
 import { logNiftyAudit } from '../helpers/nifty.scalp.audit.helper';
 import { notifyNiftyEvent } from '../helpers/nifty.scalp.notify.helper';
@@ -232,6 +232,21 @@ export class NiftyScalpEngine {
             },
         });
 
+        if (
+            !trade.plan_b_started &&
+            qty >= NIFTY_MAX_LOTS &&
+            Number(trade.stop_loss) > 0 &&
+            ltp <= Number(trade.stop_loss)
+        ) {
+            await closeNiftyScalpTrade({
+                trade,
+                position,
+                config,
+                exitReason: 'STOP_3_POINTS',
+            });
+            return 'SCANNING';
+        }
+
         if (trade.plan_b_started) {
             const cycle = await manageNiftyPlanB({ trade, position, config });
             if (cycle === 'CLOSED') return 'SCANNING';
@@ -287,20 +302,12 @@ export class NiftyScalpEngine {
             }
         }
 
-        // Averaging stays off after Plan B has started.
-        if (!trade.plan_b_started && ltp <= avgBuy - config.add_lot_points) {
-            const balance = await getNiftyStrategyBalance(config);
-            if (!canAffordLot(balance, ltp, lotSize) && config.enable_plan_b) {
-                await startNiftyPlanB({
-                    trade,
-                    position,
-                    config,
-                    balance,
-                    ltp,
-                    avgBuy,
-                });
-                return 'RECOVERY';
-            }
+        // 5-point add, hard cap 3 lots. No new Plan B when the balance is short.
+        if (
+            !trade.plan_b_started &&
+            qty < NIFTY_MAX_LOTS &&
+            ltp <= avgBuy - NIFTY_ADD_POINTS
+        ) {
             const added = await addNiftyScalpLot({ trade, position, config });
             if (added) return 'AVERAGING';
         }
@@ -388,7 +395,13 @@ export class NiftyScalpEngine {
             return 'SCANNING';
         }
 
-        const signal = await evaluateNiftyOptionSignal(config, spot, expiry);
+        const balance = await getNiftyStrategyBalance(config);
+        const signal = await evaluateNiftyOptionSignal(
+            config,
+            spot,
+            expiry,
+            balance,
+        );
 
         await logNiftyAudit({
             action: 'SIGNAL_EVAL',

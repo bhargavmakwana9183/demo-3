@@ -1,6 +1,9 @@
 import { MODEL } from '../constant';
 import { db } from '../model';
-import { NiftyScalpConfig } from './nifty.scalp.config.helper';
+import {
+    NiftyScalpConfig,
+    threeLotDownPathCost,
+} from './nifty.scalp.config.helper';
 
 const { EMA, RSI } = require('technicalindicators');
 
@@ -130,10 +133,62 @@ export const findAtmCePe = async (
     return { atm, ce, pe };
 };
 
+const optionLotSize = (option: any) =>
+    Number(option?.lot_size || option?.minimum_lot) || 0;
+
+const canReserveThreeLots = (option: any, balance: number) => {
+    const cost = threeLotDownPathCost(Number(option?.ltp), optionLotSize(option));
+    return cost != null && balance >= cost;
+};
+
+const findStrike = async (
+    expiry: string,
+    strike: number,
+    instrumentType: 'CE' | 'PE',
+) =>
+    db[MODEL.HEDGING_OPTIONS].findOne({
+        where: {
+            expiry,
+            strike_price: strike,
+            instrument_type: instrumentType,
+            name: 'NIFTY',
+        },
+    });
+
+/** ATM first. If that premium cannot fund the 3-lot drop, step OTM to a lower price. */
+const firstAffordableOption = async ({
+    side,
+    atm,
+    expiry,
+    strikeStep,
+    balance,
+    atmOption,
+}: {
+    side: 'CE' | 'PE';
+    atm: number;
+    expiry: string;
+    strikeStep: number;
+    balance: number;
+    atmOption: any;
+}) => {
+    if (atmOption && canReserveThreeLots(atmOption, balance)) return atmOption;
+    const direction = side === 'CE' ? 1 : -1;
+    for (let step = 1; step <= 4; step += 1) {
+        const option = await findStrike(
+            expiry,
+            atm + direction * strikeStep * step,
+            side,
+        );
+        if (option && canReserveThreeLots(option, balance)) return option;
+    }
+    return null;
+};
+
 export const evaluateNiftyOptionSignal = async (
     config: NiftyScalpConfig,
     spot: number,
     expiry: string,
+    balance?: number,
 ): Promise<NiftySignalResult> => {
     const { ce, pe, atm } = await findAtmCePe(
         spot,
@@ -156,7 +211,27 @@ export const evaluateNiftyOptionSignal = async (
               reason: 'CE_MISSING',
               indicators: {},
           };
-    if (ceSignal.signal === 'CE_BUY') return ceSignal;
+    if (ceSignal.signal === 'CE_BUY') {
+        if (balance == null) return ceSignal;
+        const picked = await firstAffordableOption({
+            side: 'CE',
+            atm,
+            expiry,
+            strikeStep: config.strike_step,
+            balance,
+            atmOption: ce,
+        });
+        if (picked) {
+            return {
+                ...ceSignal,
+                instrument: picked,
+                reason:
+                    picked === ce
+                        ? ceSignal.reason
+                        : `${ceSignal.reason}_LOWER_PREMIUM`,
+            };
+        }
+    }
 
     const peSignal = pe
         ? await evaluateOptionCandles(pe, 'PE', config)
@@ -165,7 +240,27 @@ export const evaluateNiftyOptionSignal = async (
               reason: 'PE_MISSING',
               indicators: {},
           };
-    if (peSignal.signal === 'PE_BUY') return peSignal;
+    if (peSignal.signal === 'PE_BUY') {
+        if (balance == null) return peSignal;
+        const picked = await firstAffordableOption({
+            side: 'PE',
+            atm,
+            expiry,
+            strikeStep: config.strike_step,
+            balance,
+            atmOption: pe,
+        });
+        if (picked) {
+            return {
+                ...peSignal,
+                instrument: picked,
+                reason:
+                    picked === pe
+                        ? peSignal.reason
+                        : `${peSignal.reason}_LOWER_PREMIUM`,
+            };
+        }
+    }
 
     return {
         signal: 'NONE',
