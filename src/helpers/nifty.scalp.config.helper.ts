@@ -113,6 +113,18 @@ export const calculateGrossPl = (
     return (ltp - avgBuy) * lotSize * qty;
 };
 
+/** Max main lots: entry + one −10 add. */
+export const NIFTY_MAX_LOTS = 2;
+export const NIFTY_SOFT_LOSS_RS = 2000;
+export const NIFTY_SOFT_UNDER_MINUTES = 25;
+export const NIFTY_NO_FOLLOW_MINUTES = 10;
+export const NIFTY_NO_FOLLOW_POINTS = 3;
+export const NIFTY_ENTRY_QUIET_UNTIL = '09:45';
+export const NIFTY_DAILY_MAX_LOSSES = 2;
+export const NIFTY_DAILY_MAX_LOSS_RS = 3000;
+export const NIFTY_HEDGE_PREMIUM_MIN = 5;
+export const NIFTY_HEDGE_PREMIUM_MAX = 15;
+
 export const canAffordLot = (
     balance: number,
     ltp: number,
@@ -122,16 +134,40 @@ export const canAffordLot = (
     return balance >= required && required > 0;
 };
 
+/**
+ * Reserve for entry: main lot + hedge lot + one add at main−10.
+ * Same check for paper and production (uses strategy_balance).
+ */
+export const twoLotWithHedgeCost = (
+    mainLtp: number,
+    hedgeLtp: number,
+    lotSize: number,
+    addPoints: number,
+): number | null => {
+    if (!(mainLtp > 0) || !(hedgeLtp > 0) || !(lotSize > 0)) return null;
+    const second = Math.max(mainLtp - addPoints, 0.05);
+    return (mainLtp + hedgeLtp + second) * lotSize;
+};
+
 export const getNiftyStrategyBalance = async (
     config: NiftyScalpConfig,
 ): Promise<number> => {
     const strategy = await db[MODEL.STRATEGY].findOne({
         where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP },
     });
-    if (strategy?.strategy_balance && strategy.strategy_balance > 0) {
+    if (strategy?.strategy_balance != null && strategy.strategy_balance > 0) {
         return Number(strategy.strategy_balance);
     }
     return Number(config.paper_balance);
+};
+
+export const setNiftyStrategyBalance = async (amount: number) => {
+    if (!Number.isFinite(amount)) return;
+    const strategy = await db[MODEL.STRATEGY].findOne({
+        where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP },
+    });
+    if (!strategy) return;
+    await strategy.update({ strategy_balance: amount });
 };
 
 export const updateNiftyStrategyBalance = async (delta: number) => {

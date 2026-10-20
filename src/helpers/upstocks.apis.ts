@@ -50,6 +50,37 @@ export const place_order_on_upstocks = async (data) => {
     }
 };
 
+/** Equity available_margin. Call after a confirmed fill — not before a buy. */
+export const get_upstox_funds_and_margin = async (
+    accessToken: string,
+): Promise<number | null> => {
+    try {
+        const response = await axios.get(
+            'https://api.upstox.com/v2/user/get-funds-and-margin',
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json',
+                    Authorization: `Bearer ${accessToken}`,
+                },
+                timeout: 10000,
+            },
+        );
+        const available = Number(
+            response.data?.data?.equity?.available_margin,
+        );
+        if (!Number.isFinite(available)) return null;
+        return available;
+    } catch (error: any) {
+        logger.warn(
+            `get_upstox_funds_and_margin failed: ${
+                error?.response?.data?.message || error?.message
+            }`,
+        );
+        return null;
+    }
+};
+
 /** Fetch live order status/average price from Upstox */
 export const get_upstox_order_details = async (
     accessToken: string,

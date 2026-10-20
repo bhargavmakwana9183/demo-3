@@ -4,6 +4,7 @@ import { db } from '../model';
 import { logger } from '../logger/logger';
 import { isLiveTradingEnabled } from './scalping.trade.helper';
 import {
+    NIFTY_MAX_LOTS,
     NiftyScalpConfig,
     calculateGrossPl,
     calculateRoundTripCharges,
@@ -11,6 +12,8 @@ import {
     canAffordLot,
     getNiftyScalpConfig,
     getNiftyStrategyBalance,
+    setNiftyStrategyBalance,
+    twoLotWithHedgeCost,
     updateNiftyStrategyBalance,
 } from './nifty.scalp.config.helper';
 import { logNiftyAudit } from './nifty.scalp.audit.helper';
@@ -24,8 +27,43 @@ import {
     waitForOrderConfirmation,
 } from './nifty.scalp.order.helper';
 import { recordTradeLeg } from './nifty.scalp.leg.helper';
+import { get_upstox_funds_and_margin } from './upstocks.apis';
 
 let entryInProgress = false;
+
+/** After confirmed live fill, replace strategy_balance with Upstox available_margin. */
+export const syncStrategyBalanceFromUpstox = async () => {
+    const user = await getTradingUser();
+    if (!user?.token) return null;
+    const available = await get_upstox_funds_and_margin(user.token);
+    if (available == null) {
+        logger.warn('Upstox funds sync skipped — no available_margin');
+        return null;
+    }
+    await setNiftyStrategyBalance(available);
+    return available;
+};
+
+/** Hedge open P/L after estimated round-trip charges. */
+export const hedgeOpenNet = (
+    trade: any,
+    lotSize: number,
+    config?: NiftyScalpConfig | null,
+) => {
+    const hedgeQty = Number(trade.hedge_qty || 0);
+    const hedgeBuy = Number(trade.hedge_buy_price || 0);
+    const hedgeLtp = Number(trade.hedge_ltp || hedgeBuy);
+    if (hedgeQty <= 0 || hedgeBuy <= 0) return 0;
+    const gross = (hedgeLtp - hedgeBuy) * lotSize * hedgeQty;
+    if (!config) return gross;
+    const charges = calculateRoundTripCharges(
+        hedgeQty,
+        lotSize,
+        hedgeBuy,
+        config,
+    );
+    return gross - charges;
+};
 
 export const processNiftyMarketFeed = async (stocks_data: any) => {
     if (!stocks_data?.feeds) return;
@@ -158,14 +196,15 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         brokerage_per_lot: Number(config?.brokerage_per_lot ?? 40),
         slippage_pct: Number(config?.slippage_pct ?? 0.002),
     } as NiftyScalpConfig);
-    const netPl = grossPl - charges;
+    const hedgeNet = hedgeOpenNet(fresh, lotSize, config);
+    const netPl = grossPl - charges + hedgeNet;
     const exitReason =
         fresh.pending_exit_reason || fresh.exit_reason || 'EXIT';
 
     await fresh.update({
         is_active: false,
         sell_price: ltp,
-        pl: grossPl,
+        pl: grossPl + hedgeNet,
         charges,
         net_pl: netPl,
         exit_reason: exitReason,
@@ -175,6 +214,7 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         broker_confirmed: true,
         exit_order_id: orderId || fresh.exit_order_id,
         last_order_error: null,
+        hedge_qty: 0,
     });
 
     await recordTradeLeg({
@@ -194,7 +234,7 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         avgBuyAfter: avgBuy,
         qtyAfter: 0,
         targetAfter: Number(fresh.target_price || 0),
-        metadata: { exitReason },
+        metadata: { exitReason, hedgeNet },
     });
 
     const position = await db[MODEL.POSITION].findByPk(fresh.position_id);
@@ -208,9 +248,14 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
 
     const user = await getTradingUser();
     if (!isLiveTradingEnabled(user, config)) {
-        await updateNiftyStrategyBalance(ltp * lotSize * qty);
+        const hedgeQty = Number(fresh.hedge_qty || 0);
+        const hedgeLtp = Number(fresh.hedge_ltp || fresh.hedge_buy_price || 0);
+        await updateNiftyStrategyBalance(
+            ltp * lotSize * qty +
+                (hedgeQty > 0 ? hedgeLtp * lotSize * hedgeQty : 0),
+        );
     } else {
-        await updateNiftyStrategyBalance(netPl);
+        await syncStrategyBalanceFromUpstox();
     }
 
     await logNiftyAudit({
@@ -246,12 +291,14 @@ export const openNiftyScalpEntry = async ({
     config,
     reason,
     indicators,
+    hedgeOption,
 }: {
     option: any;
     signal: 'CE_BUY' | 'PE_BUY';
     config: NiftyScalpConfig;
     reason: string;
     indicators: Record<string, number | undefined>;
+    hedgeOption?: any;
 }) => {
     if (entryInProgress) return null;
     entryInProgress = true;
@@ -279,21 +326,40 @@ export const openNiftyScalpEntry = async ({
             return null;
         }
 
-        const balance = await getNiftyStrategyBalance(config);
-        if (!canAffordLot(balance, quoteLtp, lotSize)) {
+        if (!hedgeOption?.instrument_key || !(Number(hedgeOption.ltp) > 0)) {
             await logNiftyAudit({
                 action: 'SKIP',
-                reason: 'INSUFFICIENT_BALANCE_ENTRY',
+                reason: 'HEDGE_OPTION_REQUIRED',
                 signal,
                 instrumentKey: option.instrument_key,
                 config,
                 indicators,
-                metadata: { balance, required: quoteLtp * lotSize },
+            });
+            return null;
+        }
+
+        const hedgeLtp = Number(hedgeOption.ltp);
+        const balance = await getNiftyStrategyBalance(config);
+        const reserved = twoLotWithHedgeCost(
+            quoteLtp,
+            hedgeLtp,
+            lotSize,
+            Number(config.add_lot_points || 10),
+        );
+        if (reserved == null || balance < reserved) {
+            await logNiftyAudit({
+                action: 'SKIP',
+                reason: 'INSUFFICIENT_BALANCE_2LOT_HEDGE',
+                signal,
+                instrumentKey: option.instrument_key,
+                config,
+                indicators,
+                metadata: { balance, required: reserved, quoteLtp, hedgeLtp },
             });
             notifyNiftyEvent(
                 'CANNOT_ADD_LOT',
-                'Not enough balance to open first lot',
-                { balance, required: quoteLtp * lotSize },
+                'Balance cannot cover main + hedge + one add lot',
+                { balance, required: reserved },
             );
             return null;
         }
@@ -301,9 +367,10 @@ export const openNiftyScalpEntry = async ({
         const user = await getTradingUser();
         const liveMode = isLiveTradingEnabled(user, config);
 
-        // PRODUCTION: place + confirm BUY before creating active trade
         let fillPrice = quoteLtp;
         let entryOrderId: string | null = null;
+        let hedgeFill = hedgeLtp;
+        let hedgeOrderId: string | null = null;
         let brokerConfirmed = !liveMode;
 
         if (liveMode) {
@@ -317,7 +384,6 @@ export const openNiftyScalpEntry = async ({
             });
 
             if (!live.ok) {
-                // Timeout / reject → do NOT open paper trade
                 await logNiftyAudit({
                     action: 'LIVE_ORDER_FAIL',
                     reason: live.timedOut
@@ -336,11 +402,36 @@ export const openNiftyScalpEntry = async ({
             fillPrice = Number(live.averagePrice || quoteLtp);
             entryOrderId = live.orderId || null;
             brokerConfirmed = true;
+
+            const hedgeLive = await placeConfirmedUpstoxOrder({
+                user,
+                config,
+                instrumentKey: hedgeOption.instrument_key,
+                quantity: lotSize * 1,
+                side: 'BUY',
+                purpose: 'ENTRY',
+            });
+            if (!hedgeLive.ok) {
+                // Main already filled — leave hedge empty; soft rules still manage main
+                await logNiftyAudit({
+                    action: 'LIVE_ORDER_FAIL',
+                    reason: 'HEDGE_BUY_FAILED',
+                    signal,
+                    instrumentKey: hedgeOption.instrument_key,
+                    config,
+                    metadata: { hedgeLive, mainOrderId: entryOrderId },
+                    skipThrottle: true,
+                });
+            } else {
+                hedgeFill = Number(hedgeLive.averagePrice || hedgeLtp);
+                hedgeOrderId = hedgeLive.orderId || null;
+            }
         }
 
         const target = calculateTargetLtp(fillPrice, 1, lotSize, config);
         const tradeId = Math.floor(100000 + Math.random() * 900000);
         const today = moment().format('YYYY-MM-DD');
+        const hasHedge = hedgeFill > 0 && hedgeOption.instrument_key;
 
         const position = await db[MODEL.POSITION].create({
             strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP,
@@ -349,7 +440,7 @@ export const openNiftyScalpEntry = async ({
             trade_id: tradeId,
             date: today,
             start_time: moment(),
-            required_margin: fillPrice * lotSize,
+            required_margin: fillPrice * lotSize + (hasHedge ? hedgeFill * lotSize : 0),
             is_exectued: true,
             is_upstock_exectued: brokerConfirmed && liveMode,
         });
@@ -365,7 +456,7 @@ export const openNiftyScalpEntry = async ({
             trade_type: 'BUY',
             buy_price: fillPrice,
             target_price: target,
-            stop_loss: fillPrice - config.add_lot_points,
+            stop_loss: 0,
             is_active: true,
             ltp: fillPrice,
             qty: 1,
@@ -378,6 +469,12 @@ export const openNiftyScalpEntry = async ({
             exit_pending: false,
             exit_retry_count: 0,
             exit_halted: false,
+            hedge_instrument_key: hasHedge ? hedgeOption.instrument_key : null,
+            hedge_trading_symbol: hasHedge ? hedgeOption.trading_symbol : null,
+            hedge_buy_price: hasHedge ? hedgeFill : null,
+            hedge_qty: hasHedge ? 1 : 0,
+            hedge_ltp: hasHedge ? hedgeFill : null,
+            hedge_entry_order_id: hedgeOrderId,
         });
 
         if (entryOrderId) {
@@ -386,9 +483,20 @@ export const openNiftyScalpEntry = async ({
                 { where: { upstock_order_id: entryOrderId } },
             );
         }
+        if (hedgeOrderId) {
+            await db[MODEL.UPSTOCK_ORDERS].update(
+                { trade_id: trade.id, postion_id: position.id },
+                { where: { upstock_order_id: hedgeOrderId } },
+            );
+        }
 
         if (!liveMode) {
-            await updateNiftyStrategyBalance(-(fillPrice * lotSize));
+            await updateNiftyStrategyBalance(
+                -(fillPrice * lotSize) -
+                    (hasHedge ? hedgeFill * lotSize : 0),
+            );
+        } else {
+            await syncStrategyBalanceFromUpstox();
         }
 
         await recordTradeLeg({
@@ -403,7 +511,16 @@ export const openNiftyScalpEntry = async ({
             avgBuyAfter: fillPrice,
             qtyAfter: 1,
             targetAfter: target,
-            metadata: { signal, brokerConfirmed },
+            metadata: {
+                signal,
+                brokerConfirmed,
+                hedge: hasHedge
+                    ? {
+                          key: hedgeOption.instrument_key,
+                          price: hedgeFill,
+                      }
+                    : null,
+            },
         });
 
         await logNiftyAudit({
@@ -424,9 +541,11 @@ export const openNiftyScalpEntry = async ({
                 liveMode,
                 entryOrderId,
                 brokerConfirmed,
+                hedgeFill: hasHedge ? hedgeFill : null,
+                hedgeKey: hasHedge ? hedgeOption.instrument_key : null,
                 thinking: liveMode
-                    ? `Upstox BUY confirmed @ ${fillPrice}. Target ${target.toFixed(2)}`
-                    : `Paper BUY @ ${fillPrice}. Target ${target.toFixed(2)}`,
+                    ? `Upstox BUY confirmed @ ${fillPrice}${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. Target ${target.toFixed(2)}`
+                    : `Paper BUY @ ${fillPrice}${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. Target ${target.toFixed(2)}`,
             },
             skipThrottle: true,
         });
@@ -434,8 +553,8 @@ export const openNiftyScalpEntry = async ({
         notifyNiftyEvent(
             'ENTRY_FILLED',
             liveMode
-                ? `Live BUY confirmed ${option.instrument_type} 1 lot @ ${fillPrice}`
-                : `Paper BUY ${option.instrument_type} 1 lot @ ${fillPrice}`,
+                ? `Live BUY ${option.instrument_type} @ ${fillPrice}${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}`
+                : `Paper BUY ${option.instrument_type} @ ${fillPrice}${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}`,
             { symbol: option.trading_symbol, fillPrice, target, entryOrderId },
         );
 
@@ -470,6 +589,7 @@ export const addNiftyScalpLot = async ({
     const avgBuy = Number(trade.buy_price);
     const qty = Number(trade.qty);
 
+    if (qty >= NIFTY_MAX_LOTS) return false;
     if (ltp > avgBuy - config.add_lot_points) return false;
 
     const balance = await getNiftyStrategyBalance(config);
@@ -526,7 +646,7 @@ export const addNiftyScalpLot = async ({
         qty: newQty,
         buy_price: newAvg,
         target_price: newTarget,
-        stop_loss: newAvg - config.add_lot_points,
+        stop_loss: 0,
         original_qty: newQty,
         ltp: addPrice,
         broker_confirmed: true,
@@ -538,6 +658,8 @@ export const addNiftyScalpLot = async ({
 
     if (!liveMode) {
         await updateNiftyStrategyBalance(-(addPrice * lotSize));
+    } else {
+        await syncStrategyBalanceFromUpstox();
     }
 
     await recordTradeLeg({
@@ -623,12 +745,34 @@ export const closeNiftyScalpTrade = async ({
         return true;
     }
 
+    const sellHedgeIfAny = async () => {
+        const hedgeKey = trade.hedge_instrument_key;
+        const hedgeQty = Number(trade.hedge_qty || 0);
+        if (!hedgeKey || hedgeQty <= 0) return;
+        const hedgeSell = await placeConfirmedUpstoxOrder({
+            user,
+            config,
+            instrumentKey: hedgeKey,
+            quantity: lotSize * hedgeQty,
+            side: 'SELL',
+            purpose: 'EXIT',
+            positionId: position.id,
+            tradeId: trade.id,
+        });
+        if (hedgeSell.ok) {
+            await trade.update({
+                hedge_ltp: Number(hedgeSell.averagePrice || trade.hedge_ltp),
+            });
+        }
+    };
+
     // Resume wait on in-flight EXIT — never double-SELL while Pending
     if (trade.exit_order_id && user?.token) {
         const existing = await db[MODEL.UPSTOCK_ORDERS].findOne({
             where: { upstock_order_id: trade.exit_order_id },
         });
         if (existing && isOrderFilled(existing.status)) {
+            await sellHedgeIfAny();
             await finalizeNiftyExitAfterBrokerFill({
                 trade,
                 sellPrice: Number(existing.average_price || ltp),
@@ -642,6 +786,7 @@ export const closeNiftyScalpTrade = async ({
                 accessToken: user.token,
             });
             if (resumed.ok) {
+                await sellHedgeIfAny();
                 await finalizeNiftyExitAfterBrokerFill({
                     trade,
                     sellPrice: Number(resumed.averagePrice || ltp),
@@ -686,6 +831,7 @@ export const closeNiftyScalpTrade = async ({
 
     if (live.ok && !live.paper) {
         await trade.update({ exit_order_id: live.orderId || null });
+        await sellHedgeIfAny();
         await finalizeNiftyExitAfterBrokerFill({
             trade,
             sellPrice: Number(live.averagePrice || ltp),

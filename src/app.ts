@@ -18,7 +18,11 @@ import * as UpstoxClient from 'upstox-js-sdk';
 import protobuf from 'protobufjs';
 import { db } from './model';
 import { Server } from 'socket.io';
-import { INDEXES, USER_DETAILS } from './constant/response.types';
+import {
+    INDEXES,
+    INDEXES_NAMES,
+    USER_DETAILS,
+} from './constant/response.types';
 import { strategyController } from './controller';
 import './config/restart.json';
 import cron from 'node-cron';
@@ -233,45 +237,10 @@ class AppServer {
                 console.log('connected');
                 resolve(ws);
                 setTimeout(async () => {
-                    // Nifty Options Scalp: subscribe near-ATM hedging keys (+ index)
-                    const allOptions = await db[MODEL.HEDGING_OPTIONS].findAll(
-                        {},
-                    );
-                    let options = allOptions;
-                    try {
-                        const spotResp = await axios.get(
-                            'https://api.upstox.com/v2/market-quote/ltp',
-                            {
-                                headers: {
-                                    Authorization:
-                                        'Bearer ' + OAUTH2.accessToken,
-                                    Accept: 'application/json',
-                                },
-                                params: {
-                                    instrument_key: INDEXES.NIFTY_50,
-                                },
-                            },
-                        );
-                        let spot = 0;
-                        for (const key in spotResp.data?.data || {}) {
-                            spot = spotResp.data.data[key].last_price;
-                            break;
-                        }
-                        if (spot > 0) {
-                            const atm = Math.round(spot / 50) * 50;
-                            options = allOptions.filter((o) => {
-                                const strike = Number(o.strike_price);
-                                return (
-                                    !Number.isNaN(strike) &&
-                                    Math.abs(strike - atm) <= 50 * 10
-                                );
-                            });
-                        }
-                    } catch (e) {
-                        logger.warn(
-                            'ATM band filter failed; subscribing all hedging keys',
-                        );
-                    }
+                    // Subscribe all current-expiry Nifty hedging options (+ index)
+                    const options = await db[MODEL.HEDGING_OPTIONS].findAll({
+                        where: { name: INDEXES_NAMES.NIFTY_50 },
+                    });
 
                     const instrumentKeys = options.map(
                         (option) => option.instrument_key,

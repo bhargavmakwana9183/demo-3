@@ -160,6 +160,35 @@ export const tradeModel = (sequelize) => {
                 type: DataTypes.FLOAT,
                 allowNull: true,
             },
+            hedge_instrument_key: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
+            hedge_trading_symbol: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
+            hedge_buy_price: {
+                type: DataTypes.FLOAT,
+                allowNull: true,
+            },
+            hedge_qty: {
+                type: DataTypes.FLOAT,
+                allowNull: false,
+                defaultValue: 0,
+            },
+            hedge_ltp: {
+                type: DataTypes.FLOAT,
+                allowNull: true,
+            },
+            hedge_entry_order_id: {
+                type: DataTypes.STRING,
+                allowNull: true,
+            },
+            soft_under_avg_at: {
+                type: DataTypes.DATE,
+                allowNull: true,
+            },
         },
         {
             paranoid: true,
