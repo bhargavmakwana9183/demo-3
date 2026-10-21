@@ -38,7 +38,11 @@ import {
     // processMarketFeed,
     STRATEGY_THROTTLE_MS,
 } from './helpers/scalping.trade.helper';
-import { processNiftyMarketFeed } from './helpers/nifty.scalp.trade.helper';
+import {
+    hedgeLegView,
+    processNiftyMarketFeed,
+} from './helpers/nifty.scalp.trade.helper';
+import { getNiftyScalpConfig } from './helpers/nifty.scalp.config.helper';
 import { setNiftyNotifyEmitter } from './helpers/nifty.scalp.notify.helper';
 import { ensureNiftyStrategyRecords } from './helpers/nifty.chain.sync.helper';
 import { handleNiftyOrderStatusUpdate } from './helpers/nifty.scalp.order.helper';
@@ -303,6 +307,7 @@ class AppServer {
 
     private async emitTodayTrades() {
         const formated_data = [];
+        const scalpConfig = await getNiftyScalpConfig();
         const trades = await db[MODEL.TRADE].findAll({
             where: {
                 createdAt: {
@@ -340,9 +345,12 @@ class AppServer {
                 storedCharges > 0
                     ? storedCharges
                     : Math.max(0, lots) * 40 * 2;
+            const mainCharges = isActive ? estCharges : storedCharges;
+            const mainOnlyNet = grossPl - mainCharges;
+            const hedge = hedgeLegView(datas, lotSize, scalpConfig);
             const netPl = isActive
-                ? grossPl - estCharges
-                : Number(datas.net_pl ?? grossPl - storedCharges);
+                ? mainOnlyNet + (hedge?.hedgeNet ?? 0)
+                : Number(datas.net_pl ?? mainOnlyNet + (hedge?.hedgeNet ?? 0));
 
             formated_data.push({
                 id: datas.trade_id,
@@ -356,8 +364,10 @@ class AppServer {
                 target: Number(datas.target_price || 0),
                 stopploss: Number(datas.stop_loss || 0),
                 profitLoss: Number(grossPl.toFixed(2)),
+                mainNet: Number(mainOnlyNet.toFixed(2)),
                 netPl: Number(netPl.toFixed(2)),
                 charges: Number((isActive ? estCharges : storedCharges).toFixed(2)),
+                ...(hedge || {}),
                 quantity: qtyUnits,
                 lots,
                 lot_size: lotSize,

@@ -65,6 +65,42 @@ export const hedgeOpenNet = (
     return gross - charges;
 };
 
+/** Hedge row for positions and history. Closed trades keep the symbol even if qty was cleared. */
+export const hedgeLegView = (
+    trade: any,
+    lotSize: number,
+    config?: NiftyScalpConfig | null,
+) => {
+    const hedgeSymbol = trade.hedge_trading_symbol || null;
+    const hedgeBuy = Number(trade.hedge_buy_price || 0);
+    const hedgeLtp = Number(trade.hedge_ltp || hedgeBuy || 0);
+    let hedgeLots = Number(trade.hedge_qty || 0);
+    if (hedgeLots <= 0 && hedgeSymbol && hedgeBuy > 0) hedgeLots = 1;
+    if (!hedgeSymbol || hedgeBuy <= 0 || hedgeLots <= 0 || !(lotSize > 0)) {
+        return null;
+    }
+    const hedgeGross = (hedgeLtp - hedgeBuy) * lotSize * hedgeLots;
+    const chargeConfig = {
+        brokerage_per_lot: Number(config?.brokerage_per_lot ?? 40),
+        slippage_pct: Number(config?.slippage_pct ?? 0.002),
+    } as NiftyScalpConfig;
+    const hedgeCharges = calculateRoundTripCharges(
+        hedgeLots,
+        lotSize,
+        hedgeBuy,
+        chargeConfig,
+    );
+    return {
+        hedgeSymbol,
+        hedgeBuy: Number(hedgeBuy.toFixed(2)),
+        hedgeLtp: Number(hedgeLtp.toFixed(2)),
+        hedgeLots,
+        hedgeGross: Number(hedgeGross.toFixed(2)),
+        hedgeCharges: Number(hedgeCharges.toFixed(2)),
+        hedgeNet: Number((hedgeGross - hedgeCharges).toFixed(2)),
+    };
+};
+
 export const processNiftyMarketFeed = async (stocks_data: any) => {
     if (!stocks_data?.feeds) return;
 
@@ -214,7 +250,6 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         broker_confirmed: true,
         exit_order_id: orderId || fresh.exit_order_id,
         last_order_error: null,
-        hedge_qty: 0,
     });
 
     await recordTradeLeg({

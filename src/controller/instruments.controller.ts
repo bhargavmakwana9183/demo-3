@@ -33,6 +33,8 @@ import {
     getTradeLegCounts,
     getTradeLegsByTradeKey,
 } from '../helpers/nifty.scalp.leg.helper';
+import { hedgeLegView } from '../helpers/nifty.scalp.trade.helper';
+import { getNiftyScalpConfig } from '../helpers/nifty.scalp.config.helper';
 const csv = require('csv-parser');
 
 class InstrumentsController {
@@ -991,8 +993,12 @@ class InstrumentsController {
                 [String(d.id), String(d.trade_id || '')].filter(Boolean),
             );
             const legCounts = await getTradeLegCounts(tradeKeys);
+            const scalpConfig = await getNiftyScalpConfig();
 
-            const formated_data = data.map((datas) => ({
+            const formated_data = data.map((datas) => {
+                const lotSize = Number(datas.lot_size || 0);
+                const hedge = hedgeLegView(datas, lotSize, scalpConfig);
+                return {
                 id: datas.trade_id,
                 tradeUuid: datas.id,
                 date: datas.createdAt,
@@ -1011,11 +1017,14 @@ class InstrumentsController {
                 exit_reason: datas.exit_reason,
                 planBStarted: Boolean(datas.plan_b_started),
                 status: datas.is_active ? 'Active' : 'Closed',
+                lots: Number(datas.qty || 0),
                 legCount:
                     legCounts[String(datas.id)] ||
                     legCounts[String(datas.trade_id)] ||
                     0,
-            }));
+                ...(hedge || {}),
+            };
+            });
 
             return sendResponse(res, {
                 responseType: RES_STATUS.GET,
@@ -1089,6 +1098,7 @@ class InstrumentsController {
                 [String(d.id), String(d.trade_id || '')].filter(Boolean),
             );
             const legCounts = await getTradeLegCounts(tradeKeys);
+            const scalpConfig = await getNiftyScalpConfig();
 
             const formated_data = trades.map((datas) => {
                 const buyPrice = Number(datas.buy_price || 0);
@@ -1112,9 +1122,13 @@ class InstrumentsController {
                     storedCharges > 0
                         ? storedCharges
                         : Math.max(0, lots) * 40 * 2;
+                const mainCharges = isActive ? estCharges : storedCharges;
+                const mainOnlyNet = grossPl - mainCharges;
+                const hedge = hedgeLegView(datas, lotSize, scalpConfig);
+                const hedgeNet = hedge?.hedgeNet ?? 0;
                 const netPl = isActive
-                    ? grossPl - estCharges
-                    : Number(datas.net_pl ?? grossPl - storedCharges);
+                    ? mainOnlyNet + hedgeNet
+                    : Number(datas.net_pl ?? mainOnlyNet + hedgeNet);
 
                 return {
                     id: datas.trade_id,
@@ -1131,10 +1145,12 @@ class InstrumentsController {
                     stopploss: Number(datas.stop_loss || 0),
                     highest_ltp: Number(datas.highest_ltp ?? ltp ?? 0),
                     profitLoss: Number(grossPl.toFixed(2)),
+                    mainNet: Number(mainOnlyNet.toFixed(2)),
                     netPl: Number(netPl.toFixed(2)),
                     charges: Number(
                         (isActive ? estCharges : storedCharges).toFixed(2),
                     ),
+                    ...(hedge || {}),
                     quantity: qtyUnits,
                     lots,
                     lot_size: lotSize,
