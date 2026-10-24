@@ -113,15 +113,63 @@ export const calculateGrossPl = (
     return (ltp - avgBuy) * lotSize * qty;
 };
 
-/** Max main lots: entry + one −10 add. */
-export const NIFTY_MAX_LOTS = 2;
-export const NIFTY_SOFT_LOSS_RS = 2000;
-export const NIFTY_SOFT_UNDER_MINUTES = 25;
-export const NIFTY_NO_FOLLOW_MINUTES = 10;
-export const NIFTY_NO_FOLLOW_POINTS = 3;
+/** One lot per trade. No averaging down. */
+export const NIFTY_MAX_LOTS = 1;
+
+/** Hard stop: exit when price is this many points below entry. */
+export const NIFTY_STOP_POINTS = 12;
+/** Backstop on net loss (covers a gap through the point stop and legacy hedged trades). */
+export const NIFTY_SOFT_LOSS_RS = 1200;
+
+/** No follow-through: minutes to wait and the minimum points the price must reach. */
+export const NIFTY_NO_FOLLOW_MINUTES = 4;
+export const NIFTY_NO_FOLLOW_POINTS = 2;
+
+/** Trailing exit. Arms once net profit reaches target_profit_rs. */
+export const NIFTY_TRAIL_POINTS = 6;
+/** Once armed, never give back below this net profit (₹). */
+export const NIFTY_TRAIL_FLOOR_RS = 150;
+/** Close at this net profit (₹) even if still rising. */
+export const NIFTY_PROFIT_CAP_RS = 800;
+/** Close an armed trade after this many minutes in the trade. */
+export const NIFTY_TRAIL_MAX_MINUTES = 20;
+
+/** Exit early if the Nifty trend flips against the side while the trade is under water. */
+export const NIFTY_SPOT_FLIP_MIN_MINUTES = 2;
+
+/** Entry quality filters. */
 export const NIFTY_ENTRY_QUIET_UNTIL = '09:45';
-export const NIFTY_DAILY_MAX_LOSSES = 2;
-export const NIFTY_DAILY_MAX_LOSS_RS = 3000;
+export const NIFTY_SPOT_5M_FAST = 5;
+export const NIFTY_SPOT_5M_SLOW = 13;
+/** Skip entries when the option is already stretched this far above/below its 9 EMA. */
+export const NIFTY_MAX_EXTENSION_PCT = 0.03;
+/** Skip when summed volume of the last 5 one-minute candles is below this. */
+export const NIFTY_MIN_VOLUME_5M = 500000;
+
+/** Day-level protection. */
+export const NIFTY_DAILY_MAX_CONSECUTIVE_LOSSES = 2;
+export const NIFTY_DAILY_MAX_LOSS_RS = 1500;
+export const NIFTY_DAILY_PROFIT_LOCK_RS = 800;
+export const NIFTY_DAILY_MAX_TRADES = 8;
+export const NIFTY_COOLDOWN_AFTER_LOSS_MIN = 15;
+
+/** Paper fills cross the spread: buy at ltp + this, sell at ltp − this (points). */
+export const NIFTY_PAPER_SPREAD_POINTS = 0.5;
+
+/** Price at which combined net equals `netRs` for a one-lot-style position. */
+export const priceForNet = (
+    avgBuy: number,
+    qty: number,
+    lotSize: number,
+    config: NiftyScalpConfig,
+    netRs: number,
+    hedgeNet = 0,
+): number => {
+    const charges = calculateRoundTripCharges(qty, lotSize, avgBuy, config);
+    return avgBuy + (netRs + charges - hedgeNet) / (lotSize * qty);
+};
+/** Opposite-side hedge buying is off. Legacy trades that already hold a hedge still close it. */
+export const NIFTY_HEDGE_ENABLED = false;
 export const NIFTY_HEDGE_PREMIUM_MIN = 5;
 export const NIFTY_HEDGE_PREMIUM_MAX = 15;
 
@@ -135,7 +183,7 @@ export const canAffordLot = (
 };
 
 /**
- * Reserve for entry: main lot + hedge lot + one add at main−10.
+ * Reserve for entry: main lot + one add at main−10, plus the hedge lot only when a hedge is used.
  * Same check for paper and production (uses strategy_balance).
  */
 export const twoLotWithHedgeCost = (
@@ -144,9 +192,13 @@ export const twoLotWithHedgeCost = (
     lotSize: number,
     addPoints: number,
 ): number | null => {
-    if (!(mainLtp > 0) || !(hedgeLtp > 0) || !(lotSize > 0)) return null;
-    const second = Math.max(mainLtp - addPoints, 0.05);
-    return (mainLtp + hedgeLtp + second) * lotSize;
+    if (!(mainLtp > 0) || !(lotSize > 0)) return null;
+    const hedge = Number(hedgeLtp) > 0 ? Number(hedgeLtp) : 0;
+    if (NIFTY_HEDGE_ENABLED && !(hedge > 0)) return null;
+    // Only reserve a second lot when more than one lot is allowed.
+    const second =
+        NIFTY_MAX_LOTS > 1 ? Math.max(mainLtp - addPoints, 0.05) : 0;
+    return (mainLtp + (NIFTY_HEDGE_ENABLED ? hedge : 0) + second) * lotSize;
 };
 
 export const getNiftyStrategyBalance = async (

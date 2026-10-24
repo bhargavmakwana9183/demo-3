@@ -1122,10 +1122,13 @@ class InstrumentsController {
                     storedCharges > 0
                         ? storedCharges
                         : Math.max(0, lots) * 40 * 2;
-                const mainCharges = isActive ? estCharges : storedCharges;
-                const mainOnlyNet = grossPl - mainCharges;
                 const hedge = hedgeLegView(datas, lotSize, scalpConfig);
                 const hedgeNet = hedge?.hedgeNet ?? 0;
+                // Closed rows store total charges (main + hedge). Open rows use the main estimate only.
+                const mainCharges = isActive
+                    ? estCharges
+                    : Math.max(0, storedCharges - (hedge?.hedgeCharges ?? 0));
+                const mainOnlyNet = grossPl - mainCharges;
                 const netPl = isActive
                     ? mainOnlyNet + hedgeNet
                     : Number(datas.net_pl ?? mainOnlyNet + hedgeNet);
@@ -1144,7 +1147,12 @@ class InstrumentsController {
                     target: Number(datas.target_price || 0),
                     stopploss: Number(datas.stop_loss || 0),
                     highest_ltp: Number(datas.highest_ltp ?? ltp ?? 0),
-                    profitLoss: Number(grossPl.toFixed(2)),
+                    // Closed rows: gross and charges cover both legs so they add up to net.
+                    profitLoss: Number(
+                        (
+                            grossPl + (isActive ? 0 : (hedge?.hedgeGross ?? 0))
+                        ).toFixed(2),
+                    ),
                     mainNet: Number(mainOnlyNet.toFixed(2)),
                     netPl: Number(netPl.toFixed(2)),
                     charges: Number(

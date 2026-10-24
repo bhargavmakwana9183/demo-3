@@ -10,14 +10,24 @@ import {
 } from '../helpers/stock.helper';
 import { buildMarketTime, canOpenNewTrade } from '../helpers/scalping.risk.helper';
 import {
-    NIFTY_DAILY_MAX_LOSSES,
+    NIFTY_COOLDOWN_AFTER_LOSS_MIN,
+    NIFTY_DAILY_MAX_CONSECUTIVE_LOSSES,
     NIFTY_DAILY_MAX_LOSS_RS,
+    NIFTY_DAILY_MAX_TRADES,
+    NIFTY_DAILY_PROFIT_LOCK_RS,
     NIFTY_ENTRY_QUIET_UNTIL,
+    NIFTY_HEDGE_ENABLED,
     NIFTY_MAX_LOTS,
     NIFTY_NO_FOLLOW_MINUTES,
     NIFTY_NO_FOLLOW_POINTS,
+    NIFTY_PROFIT_CAP_RS,
     NIFTY_SOFT_LOSS_RS,
-    NIFTY_SOFT_UNDER_MINUTES,
+    NIFTY_SPOT_FLIP_MIN_MINUTES,
+    NIFTY_STOP_POINTS,
+    NIFTY_TRAIL_FLOOR_RS,
+    NIFTY_TRAIL_MAX_MINUTES,
+    NIFTY_TRAIL_POINTS,
+    priceForNet,
     getNiftyScalpConfig,
     getNiftyStrategyBalance,
     calculateGrossPl,
@@ -28,7 +38,6 @@ import {
     spotTrendAllows,
 } from '../helpers/nifty.scalp.signal.helper';
 import {
-    addNiftyScalpLot,
     closeNiftyScalpTrade,
     hedgeOpenNet,
     openNiftyScalpEntry,
@@ -138,14 +147,62 @@ export class NiftyScalpEngine {
                 createdAt: { [Op.between]: [start, end] },
             },
         });
+        const ordered = [...closed].sort(
+            (a, b) =>
+                new Date(a.updatedAt).getTime() -
+                new Date(b.updatedAt).getTime(),
+        );
         let lossCount = 0;
         let dayNet = 0;
-        for (const t of closed) {
+        let consecutiveLosses = 0;
+        let lastLossAt: Date | null = null;
+        for (const t of ordered) {
             const n = Number(t.net_pl ?? t.pl ?? 0);
             dayNet += n;
-            if (n < 0) lossCount += 1;
+            if (n < 0) {
+                lossCount += 1;
+                consecutiveLosses += 1;
+                lastLossAt = new Date(t.updatedAt);
+            } else {
+                consecutiveLosses = 0;
+            }
         }
-        return { lossCount, dayNet };
+        return {
+            lossCount,
+            dayNet,
+            consecutiveLosses,
+            lastLossAt,
+            tradeCount: ordered.length,
+        };
+    }
+
+    /** Day-level protection. Returns a skip reason, or null when trading is allowed. */
+    private async dayLimitReason(): Promise<{
+        reason: string;
+        metadata: Record<string, unknown>;
+    } | null> {
+        const stats = await this.todayLossStats();
+        const metadata = { ...stats, lastLossAt: stats.lastLossAt?.toISOString() };
+        if (stats.dayNet <= -NIFTY_DAILY_MAX_LOSS_RS) {
+            return { reason: 'DAILY_LOSS_LIMIT', metadata };
+        }
+        if (stats.consecutiveLosses >= NIFTY_DAILY_MAX_CONSECUTIVE_LOSSES) {
+            return { reason: 'CONSECUTIVE_LOSS_LIMIT', metadata };
+        }
+        if (stats.dayNet >= NIFTY_DAILY_PROFIT_LOCK_RS) {
+            return { reason: 'DAILY_PROFIT_LOCK', metadata };
+        }
+        if (stats.tradeCount >= NIFTY_DAILY_MAX_TRADES) {
+            return { reason: 'MAX_TRADES_PER_DAY', metadata };
+        }
+        if (
+            stats.lastLossAt &&
+            Date.now() - stats.lastLossAt.getTime() <
+                NIFTY_COOLDOWN_AFTER_LOSS_MIN * 60000
+        ) {
+            return { reason: 'COOLDOWN_AFTER_LOSS', metadata };
+        }
+        return null;
     }
 
     private async manageOpenPosition(
@@ -253,69 +310,69 @@ export class NiftyScalpEngine {
             },
         });
 
-        // ₹200 after charges = main + hedge together (both legs' charges included)
-        if (netPl >= config.target_profit_rs * 0.9) {
-            await closeNiftyScalpTrade({
-                trade,
-                position,
-                config,
-                exitReason: 'TARGET_HIT',
-            });
-            return 'SCANNING';
-        }
-
-        // No follow-through: small loss exit if never moved +3 pts within N minutes
         const ageMin =
             (Date.now() - new Date(trade.createdAt).getTime()) / 60000;
-        if (
-            ageMin >= NIFTY_NO_FOLLOW_MINUTES &&
-            Number(trade.highest_ltp || ltp) <
-                avgBuy + NIFTY_NO_FOLLOW_POINTS &&
-            qty === 1
-        ) {
-            await closeNiftyScalpTrade({
-                trade,
-                position,
-                config,
-                exitReason: 'NO_FOLLOW_THROUGH',
-            });
+        const netAtPrice = (price: number) =>
+            calculateGrossPl(price, avgBuy, qty, lotSize) - charges + hedgeNet;
+        const peakNet = netAtPrice(highest);
+        const trailArmed = peakNet >= config.target_profit_rs;
+
+        const exitNow = async (exitReason: string): Promise<NiftyEngineState> => {
+            await closeNiftyScalpTrade({ trade, position, config, exitReason });
             return 'SCANNING';
+        };
+
+        // 1. Hard point stop: caps the loss on every trade.
+        if (ltp <= avgBuy - NIFTY_STOP_POINTS) {
+            return exitNow(`STOP_LOSS_${NIFTY_STOP_POINTS}PT`);
         }
 
-        // Soft net loss: combined main+hedge
+        // 2. Net-loss backstop (gap through the stop, or a legacy hedged trade).
         if (netPl <= -NIFTY_SOFT_LOSS_RS) {
-            await closeNiftyScalpTrade({
-                trade,
-                position,
-                config,
-                exitReason: 'SOFT_NET_LOSS_2000',
-            });
-            return 'SCANNING';
+            return exitNow('SOFT_NET_LOSS');
         }
 
-        // Soft time: 2 lots still ≥10 under avg for N minutes
-        const underBy = avgBuy - ltp;
-        if (qty >= NIFTY_MAX_LOTS && underBy >= config.add_lot_points) {
-            if (!trade.soft_under_avg_at) {
-                await trade.update({ soft_under_avg_at: new Date() });
-                trade.soft_under_avg_at = new Date();
-            } else {
-                const underMin =
-                    (Date.now() - new Date(trade.soft_under_avg_at).getTime()) /
-                    60000;
-                if (underMin >= NIFTY_SOFT_UNDER_MINUTES) {
-                    await closeNiftyScalpTrade({
-                        trade,
-                        position,
-                        config,
-                        exitReason: 'SOFT_TIME_UNDER_AVG',
-                    });
-                    return 'SCANNING';
+        // 3. Profit cap.
+        if (netPl >= NIFTY_PROFIT_CAP_RS) {
+            return exitNow('TARGET_HIT');
+        }
+
+        // 4. Trailing exit once net profit has reached the target.
+        if (trailArmed) {
+            const floorPrice = priceForNet(
+                avgBuy,
+                qty,
+                lotSize,
+                config,
+                NIFTY_TRAIL_FLOOR_RS,
+                hedgeNet,
+            );
+            const trailStop = Math.max(highest - NIFTY_TRAIL_POINTS, floorPrice);
+            if (ltp <= trailStop) {
+                return exitNow('TRAIL_PROFIT_EXIT');
+            }
+            if (ageMin >= NIFTY_TRAIL_MAX_MINUTES) {
+                return exitNow('TARGET_TIME_CAP');
+            }
+        } else {
+            // 5. No follow-through: never reached +N points within M minutes.
+            if (
+                ageMin >= NIFTY_NO_FOLLOW_MINUTES &&
+                highest < avgBuy + NIFTY_NO_FOLLOW_POINTS
+            ) {
+                return exitNow('NO_FOLLOW_THROUGH');
+            }
+
+            // 6. Nifty trend flipped against the side while the trade is under water.
+            if (ageMin >= NIFTY_SPOT_FLIP_MIN_MINUTES && netPl < 0) {
+                const side =
+                    String(trade.instrument_type).toUpperCase() === 'PE'
+                        ? 'PE'
+                        : 'CE';
+                if (!(await this.spotTrendStillOk(side, config))) {
+                    return exitNow('SPOT_TREND_FLIP');
                 }
             }
-        } else if (trade.soft_under_avg_at) {
-            await trade.update({ soft_under_avg_at: null });
-            trade.soft_under_avg_at = null;
         }
 
         const formattedDate = currentISTDate.toISOString().slice(0, 10);
@@ -340,38 +397,26 @@ export class NiftyScalpEngine {
             }
         }
 
-        // Max 2 lots: one add at −10 if trend still OK. No Plan B bounce cycle.
-        if (qty < NIFTY_MAX_LOTS && ltp <= avgBuy - config.add_lot_points) {
-            const side =
-                String(trade.instrument_type).toUpperCase() === 'PE'
-                    ? 'PE'
-                    : 'CE';
-            const trend = await spotTrendAllows(
-                config.underlying_instrument_key,
-                side,
-                config,
-            );
-            if (!trend.ok) {
-                await logNiftyAudit({
-                    action: 'SKIP',
-                    reason: 'ADD_BLOCKED_TREND_FLIP',
-                    instrumentKey: trade.instrument_key,
-                    tradeId: trade.id,
-                    engineState: 'IN_TRADE',
-                    config,
-                    metadata: { ltp, avgBuy, ...trend.indicators },
-                });
-            } else {
-                const added = await addNiftyScalpLot({
-                    trade,
-                    position,
-                    config,
-                });
-                if (added) return 'AVERAGING';
-            }
-        }
-
+        // One lot per trade: no averaging down, no Plan B.
         return 'IN_TRADE';
+    }
+
+    /** 1-minute Nifty trend check, cached for a few seconds so ticks do not hammer the DB. */
+    private spotFlipCache = new Map<string, { at: number; ok: boolean }>();
+
+    private async spotTrendStillOk(
+        side: 'CE' | 'PE',
+        config: Awaited<ReturnType<typeof getNiftyScalpConfig>>,
+    ): Promise<boolean> {
+        const cached = this.spotFlipCache.get(side);
+        if (cached && Date.now() - cached.at < 15_000) return cached.ok;
+        const trend = await spotTrendAllows(
+            config.underlying_instrument_key,
+            side,
+            config,
+        );
+        this.spotFlipCache.set(side, { at: Date.now(), ok: trend.ok });
+        return trend.ok;
     }
 
     private async scanForEntry(
@@ -397,17 +442,14 @@ export class NiftyScalpEngine {
             return 'SCANNING';
         }
 
-        const { lossCount, dayNet } = await this.todayLossStats();
-        if (
-            lossCount >= NIFTY_DAILY_MAX_LOSSES ||
-            dayNet <= -NIFTY_DAILY_MAX_LOSS_RS
-        ) {
+        const dayLimit = await this.dayLimitReason();
+        if (dayLimit) {
             await logNiftyAudit({
                 action: 'SKIP',
-                reason: 'DAILY_LOSS_LIMIT',
+                reason: dayLimit.reason,
                 engineState: 'SCANNING',
                 config,
-                metadata: { lossCount, dayNet },
+                metadata: dayLimit.metadata,
             });
             return 'SCANNING';
         }
@@ -507,7 +549,7 @@ export class NiftyScalpEngine {
         if (
             signal.signal === 'NONE' ||
             !signal.instrument ||
-            !signal.hedgeInstrument
+            (NIFTY_HEDGE_ENABLED && !signal.hedgeInstrument)
         ) {
             return 'SCANNING';
         }
@@ -548,6 +590,13 @@ export class NiftyScalpEngine {
                 paper_balance: config.paper_balance,
                 max_lots: NIFTY_MAX_LOTS,
                 soft_loss_rs: NIFTY_SOFT_LOSS_RS,
+                stop_points: NIFTY_STOP_POINTS,
+                trail_points: NIFTY_TRAIL_POINTS,
+                trail_floor_rs: NIFTY_TRAIL_FLOOR_RS,
+                profit_cap_rs: NIFTY_PROFIT_CAP_RS,
+                daily_max_loss_rs: NIFTY_DAILY_MAX_LOSS_RS,
+                daily_profit_lock_rs: NIFTY_DAILY_PROFIT_LOCK_RS,
+                daily_max_trades: NIFTY_DAILY_MAX_TRADES,
             },
             balance,
             expiry,

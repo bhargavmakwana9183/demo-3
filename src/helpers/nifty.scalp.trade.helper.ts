@@ -4,7 +4,9 @@ import { db } from '../model';
 import { logger } from '../logger/logger';
 import { isLiveTradingEnabled } from './scalping.trade.helper';
 import {
+    NIFTY_HEDGE_ENABLED,
     NIFTY_MAX_LOTS,
+    NIFTY_PAPER_SPREAD_POINTS,
     NiftyScalpConfig,
     calculateGrossPl,
     calculateRoundTripCharges,
@@ -105,7 +107,10 @@ export const processNiftyMarketFeed = async (stocks_data: any) => {
     if (!stocks_data?.feeds) return;
 
     for (const key of Object.keys(stocks_data.feeds)) {
-        const feedData = stocks_data.feeds[key]?.fullFeed?.marketFF;
+        // Options arrive as marketFF; the Nifty index arrives as indexFF.
+        // Index candles feed the spot-trend filters.
+        const fullFeed = stocks_data.feeds[key]?.fullFeed;
+        const feedData = fullFeed?.marketFF ?? fullFeed?.indexFF;
         if (!feedData) continue;
 
         if (feedData.ltpc?.ltp) {
@@ -132,7 +137,7 @@ export const processNiftyMarketFeed = async (stocks_data: any) => {
         if (!i1Candle) continue;
 
         const timestamp = i1Candle.ts.toNumber();
-        const volume = i1Candle.vol.toNumber();
+        const volume = i1Candle.vol?.toNumber?.() ?? 0;
         const [candle] = await db[MODEL.CANDELS].findOrCreate({
             where: {
                 ts: timestamp.toString(),
@@ -227,20 +232,27 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
     const qty = Number(fresh.qty);
     const lotSize = Number(fresh.lot_size);
     const grossPl = calculateGrossPl(ltp, avgBuy, qty, lotSize);
-    const charges = calculateRoundTripCharges(qty, lotSize, avgBuy, {
+    const mainCharges = calculateRoundTripCharges(qty, lotSize, avgBuy, {
         ...config,
         brokerage_per_lot: Number(config?.brokerage_per_lot ?? 40),
         slippage_pct: Number(config?.slippage_pct ?? 0.002),
     } as NiftyScalpConfig);
-    const hedgeNet = hedgeOpenNet(fresh, lotSize, config);
-    const netPl = grossPl - charges + hedgeNet;
+    // Legacy trades only: a hedge may still be open. New entries do not buy one.
+    const hedge = hedgeLegView(fresh, lotSize, config);
+    const hedgeGross = hedge?.hedgeGross ?? 0;
+    const hedgeCharges = hedge?.hedgeCharges ?? 0;
+    const hedgeNet = hedgeGross - hedgeCharges;
+    // pl = gross of both legs, charges = both legs, net_pl = pl − charges
+    const totalGross = grossPl + hedgeGross;
+    const charges = Number((mainCharges + hedgeCharges).toFixed(2));
+    const netPl = totalGross - charges;
     const exitReason =
         fresh.pending_exit_reason || fresh.exit_reason || 'EXIT';
 
     await fresh.update({
         is_active: false,
         sell_price: ltp,
-        pl: grossPl + hedgeNet,
+        pl: totalGross,
         charges,
         net_pl: netPl,
         exit_reason: exitReason,
@@ -263,13 +275,13 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         mode: isLiveTradingEnabled(await getTradingUser(), config)
             ? 'live'
             : 'paper',
-        grossPl,
+        grossPl: totalGross,
         netPl,
         charges,
         avgBuyAfter: avgBuy,
         qtyAfter: 0,
         targetAfter: Number(fresh.target_price || 0),
-        metadata: { exitReason, hedgeNet },
+        metadata: { exitReason, hedgeNet, hedgeGross, hedgeCharges, mainCharges },
     });
 
     const position = await db[MODEL.POSITION].findByPk(fresh.position_id);
@@ -361,7 +373,11 @@ export const openNiftyScalpEntry = async ({
             return null;
         }
 
-        if (!hedgeOption?.instrument_key || !(Number(hedgeOption.ltp) > 0)) {
+        const useHedge =
+            NIFTY_HEDGE_ENABLED &&
+            Boolean(hedgeOption?.instrument_key) &&
+            Number(hedgeOption?.ltp) > 0;
+        if (NIFTY_HEDGE_ENABLED && !useHedge) {
             await logNiftyAudit({
                 action: 'SKIP',
                 reason: 'HEDGE_OPTION_REQUIRED',
@@ -373,7 +389,7 @@ export const openNiftyScalpEntry = async ({
             return null;
         }
 
-        const hedgeLtp = Number(hedgeOption.ltp);
+        const hedgeLtp = useHedge ? Number(hedgeOption.ltp) : 0;
         const balance = await getNiftyStrategyBalance(config);
         const reserved = twoLotWithHedgeCost(
             quoteLtp,
@@ -384,7 +400,7 @@ export const openNiftyScalpEntry = async ({
         if (reserved == null || balance < reserved) {
             await logNiftyAudit({
                 action: 'SKIP',
-                reason: 'INSUFFICIENT_BALANCE_2LOT_HEDGE',
+                reason: 'INSUFFICIENT_BALANCE_2LOT',
                 signal,
                 instrumentKey: option.instrument_key,
                 config,
@@ -393,7 +409,7 @@ export const openNiftyScalpEntry = async ({
             });
             notifyNiftyEvent(
                 'CANNOT_ADD_LOT',
-                'Balance cannot cover main + hedge + one add lot',
+                'Balance cannot cover entry + one add lot',
                 { balance, required: reserved },
             );
             return null;
@@ -402,9 +418,12 @@ export const openNiftyScalpEntry = async ({
         const user = await getTradingUser();
         const liveMode = isLiveTradingEnabled(user, config);
 
-        let fillPrice = quoteLtp;
+        // Paper fills cross the spread so results are not flattered by last-price fills.
+        let fillPrice = liveMode
+            ? quoteLtp
+            : Number((quoteLtp + NIFTY_PAPER_SPREAD_POINTS).toFixed(2));
         let entryOrderId: string | null = null;
-        let hedgeFill = hedgeLtp;
+        let hedgeFill = useHedge ? hedgeLtp : 0;
         let hedgeOrderId: string | null = null;
         let brokerConfirmed = !liveMode;
 
@@ -438,35 +457,38 @@ export const openNiftyScalpEntry = async ({
             entryOrderId = live.orderId || null;
             brokerConfirmed = true;
 
-            const hedgeLive = await placeConfirmedUpstoxOrder({
-                user,
-                config,
-                instrumentKey: hedgeOption.instrument_key,
-                quantity: lotSize * 1,
-                side: 'BUY',
-                purpose: 'ENTRY',
-            });
-            if (!hedgeLive.ok) {
-                // Main already filled — leave hedge empty; soft rules still manage main
-                await logNiftyAudit({
-                    action: 'LIVE_ORDER_FAIL',
-                    reason: 'HEDGE_BUY_FAILED',
-                    signal,
-                    instrumentKey: hedgeOption.instrument_key,
+            if (useHedge) {
+                const hedgeLive = await placeConfirmedUpstoxOrder({
+                    user,
                     config,
-                    metadata: { hedgeLive, mainOrderId: entryOrderId },
-                    skipThrottle: true,
+                    instrumentKey: hedgeOption.instrument_key,
+                    quantity: lotSize * 1,
+                    side: 'BUY',
+                    purpose: 'ENTRY',
                 });
-            } else {
-                hedgeFill = Number(hedgeLive.averagePrice || hedgeLtp);
-                hedgeOrderId = hedgeLive.orderId || null;
+                if (!hedgeLive.ok) {
+                    // Main already filled — leave hedge empty; soft rules still manage main
+                    await logNiftyAudit({
+                        action: 'LIVE_ORDER_FAIL',
+                        reason: 'HEDGE_BUY_FAILED',
+                        signal,
+                        instrumentKey: hedgeOption.instrument_key,
+                        config,
+                        metadata: { hedgeLive, mainOrderId: entryOrderId },
+                        skipThrottle: true,
+                    });
+                    hedgeFill = 0;
+                } else {
+                    hedgeFill = Number(hedgeLive.averagePrice || hedgeLtp);
+                    hedgeOrderId = hedgeLive.orderId || null;
+                }
             }
         }
 
         const target = calculateTargetLtp(fillPrice, 1, lotSize, config);
         const tradeId = Math.floor(100000 + Math.random() * 900000);
         const today = moment().format('YYYY-MM-DD');
-        const hasHedge = hedgeFill > 0 && hedgeOption.instrument_key;
+        const hasHedge = useHedge && hedgeFill > 0;
 
         const position = await db[MODEL.POSITION].create({
             strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP,
@@ -775,7 +797,10 @@ export const closeNiftyScalpTrade = async ({
     if (!liveMode) {
         await finalizeNiftyExitAfterBrokerFill({
             trade,
-            sellPrice: ltp,
+            sellPrice: Math.max(
+                Number((ltp - NIFTY_PAPER_SPREAD_POINTS).toFixed(2)),
+                0.05,
+            ),
         });
         return true;
     }
