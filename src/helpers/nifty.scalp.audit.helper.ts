@@ -19,7 +19,21 @@ export type NiftyAuditAction =
     | 'LIVE_ORDER_FAIL'
     | 'CHAIN_SYNC'
     | 'HEDGING_SYNC'
-    | 'ENTRY_FILLED';
+    | 'ENTRY_FILLED'
+    // Live order lifecycle: every step the system takes is recorded
+    | 'ENTRY_ATTEMPT'
+    | 'EXIT_DECISION'
+    | 'ORDER_PLACING'
+    | 'ORDER_PLACED'
+    | 'ORDER_STATUS'
+    | 'ORDER_FILLED'
+    | 'ORDER_REJECTED'
+    | 'ORDER_TIMEOUT'
+    | 'ORDER_CANCEL'
+    | 'ORDER_ADOPTED'
+    | 'SAFETY_CHECK'
+    | 'PRICE_CORRECTED'
+    | 'MODE_TOGGLE';
 
 const lastTickLogAt = new Map<string, number>();
 const TICK_THROTTLE_MS = 8_000;
@@ -51,6 +65,19 @@ export const logNiftyAudit = async (input: {
         'CHAIN_SYNC',
         'HEDGING_SYNC',
         'PARTIAL',
+        'ENTRY_ATTEMPT',
+        'EXIT_DECISION',
+        'ORDER_PLACING',
+        'ORDER_PLACED',
+        'ORDER_STATUS',
+        'ORDER_FILLED',
+        'ORDER_REJECTED',
+        'ORDER_TIMEOUT',
+        'ORDER_CANCEL',
+        'ORDER_ADOPTED',
+        'PRICE_CORRECTED',
+        'MODE_TOGGLE',
+        'RECONCILE',
     ].includes(input.action);
 
     if (!alwaysLog && !input.skipThrottle) {

@@ -39,6 +39,7 @@ import {
 } from '../helpers/nifty.scalp.signal.helper';
 import {
     closeNiftyScalpTrade,
+    getEntryCooldownRemainingMs,
     hedgeOpenNet,
     openNiftyScalpEntry,
 } from '../helpers/nifty.scalp.trade.helper';
@@ -65,7 +66,31 @@ export type NiftyEngineState =
 export class NiftyScalpEngine {
     private lastCarryLogDate: string | null = null;
 
+    /**
+     * Ticks arrive every second but placing an order can take up to ~30s.
+     * Never run two ticks at once: a second tick would act on a half-finished
+     * order (for example send another SELL).
+     */
+    private runningSince = 0;
+    private lastHaltLogAt = 0;
+    private static readonly RUN_STALE_MS = 120_000;
+
     async run(): Promise<NiftyEngineState> {
+        if (
+            this.runningSince &&
+            Date.now() - this.runningSince < NiftyScalpEngine.RUN_STALE_MS
+        ) {
+            return 'IN_TRADE';
+        }
+        this.runningSince = Date.now();
+        try {
+            return await this.runOnce();
+        } finally {
+            this.runningSince = 0;
+        }
+    }
+
+    private async runOnce(): Promise<NiftyEngineState> {
         const config = await getNiftyScalpConfig();
 
         if (!config.is_active) {
@@ -250,19 +275,25 @@ export class NiftyScalpEngine {
         recordNiftyPriceTick(String(trade.id), ltp);
 
         if (trade.exit_halted) {
-            await logNiftyAudit({
-                action: 'LIVE_ORDER_FAIL',
-                reason: 'EXIT_HALTED',
-                instrumentKey: trade.instrument_key,
-                tradeId: trade.id,
-                engineState: 'IN_TRADE',
-                config,
-                metadata: {
-                    ltp,
-                    retries: trade.exit_retry_count,
-                    lastError: trade.last_order_error,
-                },
-            });
+            // Log once a minute, not every tick.
+            if (Date.now() - this.lastHaltLogAt > 60_000) {
+                this.lastHaltLogAt = Date.now();
+                await logNiftyAudit({
+                    action: 'LIVE_ORDER_FAIL',
+                    reason: 'EXIT_HALTED',
+                    instrumentKey: trade.instrument_key,
+                    tradeId: trade.id,
+                    engineState: 'HALTED',
+                    config,
+                    skipThrottle: true,
+                    metadata: {
+                        ltp,
+                        retries: trade.exit_retry_count,
+                        lastError: trade.last_order_error,
+                        thinking: `Exit is HALTED after ${trade.exit_retry_count} failed SELL attempts (last error: ${trade.last_order_error}). The position is still open at Upstox and the engine will not send more orders. Square it off manually on Upstox.`,
+                    },
+                });
+            }
             return 'HALTED';
         }
 
@@ -317,24 +348,54 @@ export class NiftyScalpEngine {
         const peakNet = netAtPrice(highest);
         const trailArmed = peakNet >= config.target_profit_rs;
 
-        const exitNow = async (exitReason: string): Promise<NiftyEngineState> => {
+        const exitNow = async (
+            exitReason: string,
+            why: string,
+        ): Promise<NiftyEngineState> => {
+            // Record the decision with the numbers it was based on, BEFORE any order.
+            await logNiftyAudit({
+                action: 'EXIT_DECISION',
+                reason: exitReason,
+                instrumentKey: trade.instrument_key,
+                tradeId: trade.id,
+                engineState: 'EXITING',
+                config,
+                skipThrottle: true,
+                metadata: {
+                    ltp,
+                    avgBuy,
+                    highest,
+                    netPl: Number(netPl.toFixed(2)),
+                    ageMin: Number(ageMin.toFixed(1)),
+                    thinking: `Exit decided: ${why} (LTP ${ltp}, bought ${avgBuy}, peak ${highest}, open net ₹${netPl.toFixed(2)}, held ${ageMin.toFixed(1)} min). Closing the whole position now.`,
+                },
+            });
             await closeNiftyScalpTrade({ trade, position, config, exitReason });
             return 'SCANNING';
         };
 
         // 1. Hard point stop: caps the loss on every trade.
         if (ltp <= avgBuy - NIFTY_STOP_POINTS) {
-            return exitNow(`STOP_LOSS_${NIFTY_STOP_POINTS}PT`);
+            return exitNow(
+                `STOP_LOSS_${NIFTY_STOP_POINTS}PT`,
+                `price fell ${(avgBuy - ltp).toFixed(2)} pts below entry, at or past the ${NIFTY_STOP_POINTS}-pt hard stop`,
+            );
         }
 
         // 2. Net-loss backstop (gap through the stop, or a legacy hedged trade).
         if (netPl <= -NIFTY_SOFT_LOSS_RS) {
-            return exitNow('SOFT_NET_LOSS');
+            return exitNow(
+                'SOFT_NET_LOSS',
+                `open net loss ₹${netPl.toFixed(2)} reached the ₹${NIFTY_SOFT_LOSS_RS} backstop`,
+            );
         }
 
         // 3. Profit cap.
         if (netPl >= NIFTY_PROFIT_CAP_RS) {
-            return exitNow('TARGET_HIT');
+            return exitNow(
+                'TARGET_HIT',
+                `open net profit ₹${netPl.toFixed(2)} reached the ₹${NIFTY_PROFIT_CAP_RS} profit cap`,
+            );
         }
 
         // 4. Trailing exit once net profit has reached the target.
@@ -349,10 +410,16 @@ export class NiftyScalpEngine {
             );
             const trailStop = Math.max(highest - NIFTY_TRAIL_POINTS, floorPrice);
             if (ltp <= trailStop) {
-                return exitNow('TRAIL_PROFIT_EXIT');
+                return exitNow(
+                    'TRAIL_PROFIT_EXIT',
+                    `trailing stop hit: price ${ltp} fell to the trail level ${trailStop.toFixed(2)} (peak ${highest} minus ${NIFTY_TRAIL_POINTS} pts, floor ${floorPrice.toFixed(2)}) after the trade had reached the profit target`,
+                );
             }
             if (ageMin >= NIFTY_TRAIL_MAX_MINUTES) {
-                return exitNow('TARGET_TIME_CAP');
+                return exitNow(
+                    'TARGET_TIME_CAP',
+                    `profit target was reached but the trade has run ${ageMin.toFixed(1)} min (limit ${NIFTY_TRAIL_MAX_MINUTES}), so I bank the profit`,
+                );
             }
         } else {
             // 5. No follow-through: never reached +N points within M minutes.
@@ -360,7 +427,10 @@ export class NiftyScalpEngine {
                 ageMin >= NIFTY_NO_FOLLOW_MINUTES &&
                 highest < avgBuy + NIFTY_NO_FOLLOW_POINTS
             ) {
-                return exitNow('NO_FOLLOW_THROUGH');
+                return exitNow(
+                    'NO_FOLLOW_THROUGH',
+                    `after ${ageMin.toFixed(1)} min the price never got +${NIFTY_NO_FOLLOW_POINTS} pts above entry (peak ${highest}), so the entry is not working`,
+                );
             }
 
             // 6. Nifty trend flipped against the side while the trade is under water.
@@ -370,7 +440,10 @@ export class NiftyScalpEngine {
                         ? 'PE'
                         : 'CE';
                 if (!(await this.spotTrendStillOk(side, config))) {
-                    return exitNow('SPOT_TREND_FLIP');
+                    return exitNow(
+                        'SPOT_TREND_FLIP',
+                        `Nifty's 1-minute trend turned against this ${side} while the trade is losing`,
+                    );
                 }
             }
         }
@@ -450,6 +523,21 @@ export class NiftyScalpEngine {
                 engineState: 'SCANNING',
                 config,
                 metadata: dayLimit.metadata,
+            });
+            return 'SCANNING';
+        }
+
+        const cooldownMs = getEntryCooldownRemainingMs();
+        if (cooldownMs > 0) {
+            await logNiftyAudit({
+                action: 'SKIP',
+                reason: 'ENTRY_RETRY_COOLDOWN',
+                engineState: 'SCANNING',
+                config,
+                metadata: {
+                    remainingSec: Math.ceil(cooldownMs / 1000),
+                    thinking: `The last live BUY failed. Waiting ${Math.ceil(cooldownMs / 1000)}s more before looking for a new entry, so the same signal is not retried every second.`,
+                },
             });
             return 'SCANNING';
         }

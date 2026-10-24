@@ -43,8 +43,10 @@ import {
 } from '../helpers/nifty.chain.sync.helper';
 import {
     closeNiftyScalpTrade,
+    hasActiveNiftyTrade,
     manualOpenNiftyScalpEntry,
 } from '../helpers/nifty.scalp.trade.helper';
+import { logNiftyAudit } from '../helpers/nifty.scalp.audit.helper';
 import { logger } from '../logger/logger';
 import { Op } from 'sequelize';
 import moment from 'moment';
@@ -1317,6 +1319,52 @@ class StrategyController {
                 bodyProduction(req.body?.production ?? req.body?.live ?? req.query?.production);
 
             await ensureNiftyStrategyRecords();
+
+            const before = await getNiftyScalpConfig();
+            const userBefore = await db[MODEL.USER].findOne({
+                where: { email: USER_DETAILS.EMAIL },
+            });
+            const wasLive = before.mode === 'live' && Boolean(userBefore?.is_live);
+            const changing = wasLive !== production;
+
+            // Switching live/paper while a trade is open would close a real
+            // position as paper (or send a real SELL for a paper trade).
+            if (changing && (await hasActiveNiftyTrade())) {
+                await logNiftyAudit({
+                    action: 'MODE_TOGGLE',
+                    reason: 'TOGGLE_BLOCKED_OPEN_TRADE',
+                    config: before,
+                    skipThrottle: true,
+                    metadata: {
+                        requested: production ? 'live' : 'paper',
+                        thinking: `Switch to ${production ? 'LIVE' : 'PAPER'} refused: a Nifty trade is open. Changing mode now could close a real position as paper or sell something that was never bought. Close the trade first.`,
+                    },
+                });
+                return res.status(409).json({
+                    status: RES_STATUS.UPDATE,
+                    data: { production: wasLive, mode: before.mode, isLive: wasLive },
+                    message:
+                        'A Nifty trade is open. Close it before switching between paper and live.',
+                });
+            }
+            if (production && !userBefore?.token) {
+                await logNiftyAudit({
+                    action: 'MODE_TOGGLE',
+                    reason: 'TOGGLE_BLOCKED_NO_TOKEN',
+                    config: before,
+                    skipThrottle: true,
+                    metadata: {
+                        thinking:
+                            'Switch to LIVE refused: there is no Upstox access token. Login to Upstox first.',
+                    },
+                });
+                return res.status(400).json({
+                    status: RES_STATUS.UPDATE,
+                    data: { production: wasLive, mode: before.mode, isLive: wasLive },
+                    message: 'No Upstox token. Login to Upstox before enabling live.',
+                });
+            }
+
             await db[MODEL.STRATEGY_CONFIG].update(
                 { mode: production ? 'live' : 'paper' },
                 { where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP } },
@@ -1327,6 +1375,19 @@ class StrategyController {
             );
 
             const config = await getNiftyScalpConfig();
+            if (changing) {
+                await logNiftyAudit({
+                    action: 'MODE_TOGGLE',
+                    reason: production ? 'SWITCHED_TO_LIVE' : 'SWITCHED_TO_PAPER',
+                    config,
+                    skipThrottle: true,
+                    metadata: {
+                        thinking: production
+                            ? 'Live trading switched ON (strategy mode live and user is_live). New entries now send real Upstox orders.'
+                            : 'Live trading switched OFF. New entries are paper trades; no real orders are sent.',
+                    },
+                });
+            }
             return res.status(200).json({
                 status: RES_STATUS.UPDATE,
                 data: {
@@ -1457,6 +1518,20 @@ class StrategyController {
 
             const position = await db[MODEL.POSITION].findByPk(trade.position_id);
             const config = await getNiftyScalpConfig();
+            await logNiftyAudit({
+                action: 'EXIT_DECISION',
+                reason: 'MANUAL_EOD_SELL',
+                instrumentKey: trade.instrument_key,
+                tradeId: trade.id,
+                engineState: 'EXITING',
+                config,
+                skipThrottle: true,
+                metadata: {
+                    ltp: Number(trade.ltp),
+                    avgBuy: Number(trade.buy_price),
+                    thinking: `You chose to sell manually (after the 3:10 prompt). Closing the position at the market (LTP ${Number(trade.ltp)}, bought ${Number(trade.buy_price)}).`,
+                },
+            });
             const closed = await closeNiftyScalpTrade({
                 trade,
                 position,

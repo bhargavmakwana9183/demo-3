@@ -81,12 +81,48 @@ export const get_upstox_funds_and_margin = async (
     }
 };
 
+/**
+ * Cancel a pending order (v3 HFT endpoint, same host as place).
+ * Returns { ok, error }. A "cancel accepted" does NOT mean cancelled yet — re-read the order.
+ */
+export const cancel_upstox_order = async (
+    accessToken: string,
+    orderId: string,
+): Promise<{ ok: boolean; error?: any; raw?: any }> => {
+    try {
+        const response = await axios.delete(
+            'https://api-hft.upstox.com/v3/order/cancel',
+            {
+                headers: {
+                    Accept: 'application/json',
+                    Authorization: `Bearer ${accessToken}`,
+                },
+                params: { order_id: orderId },
+                timeout: 10000,
+            },
+        );
+        logger.info(`Upstox cancel order ${orderId}`);
+        return { ok: response.data?.status !== 'error', raw: response.data };
+    } catch (error: any) {
+        logger.warn(
+            `cancel_upstox_order(${orderId}) failed: ${
+                JSON.stringify(error?.response?.data) || error?.message
+            }`,
+        );
+        return {
+            ok: false,
+            error: error?.response?.data || error?.message || 'cancel_failed',
+        };
+    }
+};
+
 /** Fetch live order status/average price from Upstox */
 export const get_upstox_order_details = async (
     accessToken: string,
     orderId: string,
 ): Promise<{
     status: string;
+    status_message?: string;
     average_price?: number;
     filled_quantity?: number;
     pending_quantity?: number;
@@ -110,12 +146,12 @@ export const get_upstox_order_details = async (
         ).toLowerCase();
         return {
             status,
-            average_price: Number(
-                d?.average_price ?? d?.avg_price ?? d?.price ?? 0,
-            ),
-            filled_quantity: Number(
-                d?.filled_quantity ?? d?.filled_qty ?? d?.quantity ?? 0,
-            ),
+            status_message:
+                d?.status_message_raw || d?.status_message || undefined,
+            // Never fall back to limit price or ordered quantity: an unfilled
+            // order must not look filled.
+            average_price: Number(d?.average_price ?? d?.avg_price ?? 0),
+            filled_quantity: Number(d?.filled_quantity ?? d?.filled_qty ?? 0),
             pending_quantity: Number(d?.pending_quantity ?? 0),
             raw: d,
         };

@@ -7,6 +7,7 @@ import {
     NIFTY_HEDGE_ENABLED,
     NIFTY_MAX_LOTS,
     NIFTY_PAPER_SPREAD_POINTS,
+    NIFTY_STOP_POINTS,
     NiftyScalpConfig,
     calculateGrossPl,
     calculateRoundTripCharges,
@@ -21,17 +22,49 @@ import {
 import { logNiftyAudit } from './nifty.scalp.audit.helper';
 import { notifyNiftyEvent } from './nifty.scalp.notify.helper';
 import {
+    EXIT_RETRY_BACKOFF_SEC,
     MAX_EXIT_RETRIES,
+    errText,
+    flattenStrayQuantity,
     isOrderFilled,
     isOrderPending,
     isOrderRejected,
     placeConfirmedUpstoxOrder,
     waitForOrderConfirmation,
 } from './nifty.scalp.order.helper';
+import { getUpstoxPositionsOrNull } from './scalping.reconciliation.helper';
 import { recordTradeLeg } from './nifty.scalp.leg.helper';
-import { get_upstox_funds_and_margin } from './upstocks.apis';
+import {
+    get_upstox_funds_and_margin,
+    get_upstox_order_details,
+} from './upstocks.apis';
 
 let entryInProgress = false;
+
+/** Trades whose SELL is being placed / awaited right now (stops a second SELL). */
+const exitsInFlight = new Set<string>();
+export const isExitInFlight = (tradeId: string) =>
+    exitsInFlight.has(String(tradeId));
+
+/** Earliest time the next exit attempt may run, per trade (retry backoff). */
+const exitRetryNotBefore = new Map<string, number>();
+
+/** After a failed live BUY, wait before trying again (the signal stays true for a minute). */
+export const ENTRY_FAIL_COOLDOWN_MS = 90_000;
+let entryRetryNotBefore = 0;
+export const getEntryCooldownRemainingMs = () =>
+    Math.max(0, entryRetryNotBefore - Date.now());
+const startEntryCooldown = () => {
+    entryRetryNotBefore = Date.now() + ENTRY_FAIL_COOLDOWN_MS;
+};
+
+/** True when a Nifty trade is open: the live/paper switch must not change then. */
+export const hasActiveNiftyTrade = async () => {
+    const p = await db[MODEL.POSITION].findOne({
+        where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP, is_active: true },
+    });
+    return Boolean(p);
+};
 
 /** After confirmed live fill, replace strategy_balance with Upstox available_margin. */
 export const syncStrategyBalanceFromUpstox = async () => {
@@ -170,24 +203,32 @@ export const processNiftyMarketFeed = async (stocks_data: any) => {
     }
 };
 
+const finalizing = new Set<string>();
+
 const getTradingUser = async () =>
     db[MODEL.USER].findOne({ where: { email: USER_DETAILS.EMAIL } });
 
-const markExitRetry = async (
+export const markExitRetry = async (
     trade: any,
     error: any,
     config: NiftyScalpConfig,
 ) => {
     const retries = Number(trade.exit_retry_count || 0) + 1;
     const halted = retries >= MAX_EXIT_RETRIES;
+    const waitSec =
+        EXIT_RETRY_BACKOFF_SEC[
+            Math.min(retries - 1, EXIT_RETRY_BACKOFF_SEC.length - 1)
+        ];
+    if (!halted) {
+        exitRetryNotBefore.set(String(trade.id), Date.now() + waitSec * 1000);
+    }
+    const errorText = errText(error);
     await trade.update({
         exit_pending: true,
         exit_retry_count: retries,
         exit_halted: halted,
         order_lifecycle: halted ? 'HALTED' : 'EXIT_PENDING',
-        last_order_error: String(
-            error?.message || error?.error || error || 'EXIT_FAILED',
-        ),
+        last_order_error: errorText.slice(0, 500),
         is_active: true,
     });
     await logNiftyAudit({
@@ -196,14 +237,22 @@ const markExitRetry = async (
         instrumentKey: trade.instrument_key,
         tradeId: trade.id,
         config,
-        metadata: { retries, max: MAX_EXIT_RETRIES, error },
+        metadata: {
+            retries,
+            max: MAX_EXIT_RETRIES,
+            nextRetryInSec: halted ? null : waitSec,
+            error: errorText,
+            thinking: halted
+                ? `SELL failed ${retries} times (last: ${errorText}). I stopped retrying so I do not spam Upstox. The position is STILL OPEN at the broker: square it off manually on Upstox.`
+                : `SELL attempt ${retries}/${MAX_EXIT_RETRIES} failed (${errorText}). The position is still held, so the trade stays OPEN. Next attempt in ${waitSec}s.`,
+        },
         skipThrottle: true,
     });
     notifyNiftyEvent(
         'LIVE_ORDER_FAIL',
         halted
             ? `Exit failed ${retries}x — HALTED. Square off manually on Upstox`
-            : `Exit not confirmed — retry ${retries}/${MAX_EXIT_RETRIES} (trade stays OPEN)`,
+            : `Exit not confirmed — retry ${retries}/${MAX_EXIT_RETRIES} in ${waitSec}s (trade stays OPEN)`,
         { tradeId: trade.id, retries },
     );
     return { halted, retries };
@@ -219,6 +268,25 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
     sellPrice: number;
     orderId?: string;
 }) => {
+    // Two paths can learn about the same fill at once (engine wait + portfolio feed).
+    if (finalizing.has(String(trade.id))) return false;
+    finalizing.add(String(trade.id));
+    try {
+        return await finalizeNiftyExitInner({ trade, sellPrice, orderId });
+    } finally {
+        finalizing.delete(String(trade.id));
+    }
+};
+
+const finalizeNiftyExitInner = async ({
+    trade,
+    sellPrice,
+    orderId,
+}: {
+    trade: any;
+    sellPrice: number;
+    orderId?: string;
+}) => {
     const fresh = await db[MODEL.TRADE].findByPk(trade.id);
     if (!fresh || !fresh.is_active) return false;
 
@@ -226,6 +294,9 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP },
     });
     const config = configRow?.get({ plain: true }) as NiftyScalpConfig;
+    const entryPosition = await db[MODEL.POSITION].findByPk(fresh.position_id);
+    // Mode follows how the trade was ENTERED, not the switch position now.
+    const tradeWasLive = Boolean(entryPosition?.is_upstock_exectued);
 
     const ltp = Number(sellPrice || fresh.ltp);
     const avgBuy = Number(fresh.buy_price);
@@ -272,9 +343,7 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         price: ltp,
         reason: exitReason,
         brokerOrderId: orderId || fresh.exit_order_id,
-        mode: isLiveTradingEnabled(await getTradingUser(), config)
-            ? 'live'
-            : 'paper',
+        mode: tradeWasLive ? 'live' : 'paper',
         grossPl: totalGross,
         netPl,
         charges,
@@ -293,16 +362,22 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
         });
     }
 
-    const user = await getTradingUser();
-    if (!isLiveTradingEnabled(user, config)) {
+    exitRetryNotBefore.delete(String(fresh.id));
+    let balanceNote = '';
+    if (!tradeWasLive) {
         const hedgeQty = Number(fresh.hedge_qty || 0);
         const hedgeLtp = Number(fresh.hedge_ltp || fresh.hedge_buy_price || 0);
         await updateNiftyStrategyBalance(
             ltp * lotSize * qty +
                 (hedgeQty > 0 ? hedgeLtp * lotSize * hedgeQty : 0),
         );
+        balanceNote = 'Paper balance credited with the sale proceeds.';
     } else {
-        await syncStrategyBalanceFromUpstox();
+        const synced = await syncStrategyBalanceFromUpstox();
+        balanceNote =
+            synced != null
+                ? `Balance re-read from Upstox: ₹${Number(synced).toFixed(2)}.`
+                : 'Upstox balance read failed; balance will refresh on the next sync.';
     }
 
     await logNiftyAudit({
@@ -320,14 +395,256 @@ export const finalizeNiftyExitAfterBrokerFill = async ({
             charges,
             netPl,
             orderId,
-            thinking: `Broker-confirmed exit @ ${ltp}. Net ₹${netPl.toFixed(2)}`,
+            mode: tradeWasLive ? 'live' : 'paper',
+            thinking: `${tradeWasLive ? 'Upstox confirmed the SELL' : 'Paper SELL filled'} at ${ltp} (bought ${avgBuy}, ${qty} lot x ${lotSize}). Gross ₹${totalGross.toFixed(2)} - charges ₹${charges.toFixed(2)} = net ₹${netPl.toFixed(2)}. Reason: ${exitReason}. Trade closed. ${balanceNote}`,
         },
         skipThrottle: true,
     });
     notifyNiftyEvent(
         exitReason === 'TARGET_HIT' ? 'TARGET_HIT' : 'EXIT',
-        `Sold (broker confirmed). Net P&L ₹${netPl.toFixed(2)}`,
+        `Sold (${tradeWasLive ? 'broker confirmed' : 'paper'}). Net P&L ₹${netPl.toFixed(2)}`,
         { ltp, qty, netPl, exitReason, orderId },
+    );
+    return true;
+};
+
+/** Exit price was recorded from a quote (broker gave no average). Fix it once the real fill arrives. */
+export const correctClosedTradeExitPrice = async ({
+    trade,
+    brokerPrice,
+    orderId,
+    config,
+}: {
+    trade: any;
+    brokerPrice: number;
+    orderId: string;
+    config: NiftyScalpConfig;
+}) => {
+    const fresh = await db[MODEL.TRADE].findByPk(trade.id);
+    if (!fresh || fresh.is_active) return false;
+    const oldSell = Number(fresh.sell_price || 0);
+    if (Math.abs(oldSell - brokerPrice) <= 0.004) return false;
+
+    const qty = Number(fresh.qty);
+    const lotSize = Number(fresh.lot_size);
+    const avgBuy = Number(fresh.buy_price);
+    const hedge = hedgeLegView(fresh, lotSize, config);
+    const totalGross =
+        calculateGrossPl(brokerPrice, avgBuy, qty, lotSize) +
+        (hedge?.hedgeGross ?? 0);
+    const charges = Number(fresh.charges || 0);
+    const netPl = totalGross - charges;
+    const oldNet = Number(fresh.net_pl || 0);
+
+    await fresh.update({ sell_price: brokerPrice, pl: totalGross, net_pl: netPl });
+    const position = await db[MODEL.POSITION].findByPk(fresh.position_id);
+    if (position) await position.update({ pl: netPl });
+    await syncStrategyBalanceFromUpstox();
+
+    await logNiftyAudit({
+        action: 'PRICE_CORRECTED',
+        reason: 'EXIT_PRICE_FROM_BROKER',
+        instrumentKey: fresh.instrument_key,
+        tradeId: fresh.id,
+        config,
+        skipThrottle: true,
+        metadata: {
+            orderId,
+            oldSellPrice: oldSell,
+            newSellPrice: brokerPrice,
+            oldNetPl: oldNet,
+            newNetPl: netPl,
+            thinking: `The trade was closed using a quoted exit price (${oldSell}). Upstox's real average sell price is ${brokerPrice}, so P/L was corrected: net ₹${oldNet.toFixed(2)} -> ₹${netPl.toFixed(2)}.`,
+        },
+    });
+    notifyNiftyEvent(
+        'EXIT',
+        `Exit price corrected to Upstox fill ${brokerPrice}. Net ₹${netPl.toFixed(2)}`,
+        { tradeId: fresh.id, orderId },
+    );
+    return true;
+};
+
+/**
+ * A BUY we stopped watching (timeout / restart) has filled at Upstox.
+ * Turn it into a managed trade so it gets a stop-loss and exit.
+ * If it cannot be managed (partial lot, another trade open), sell it back.
+ */
+export const adoptOrphanEntryFill = async ({
+    orderRow,
+    averagePrice,
+    filledQty,
+    config,
+}: {
+    orderRow: any;
+    averagePrice: number;
+    filledQty: number;
+    config: NiftyScalpConfig;
+}) => {
+    // Claim the row so the feed and the reconcile cron cannot both adopt it.
+    const [claimed] = await db[MODEL.UPSTOCK_ORDERS].update(
+        { purpose: 'ENTRY_ADOPTING' },
+        { where: { id: orderRow.id, purpose: 'ENTRY_ORPHAN' } },
+    );
+    if (!claimed) return false;
+
+    const instrumentKey = orderRow.instrument_key;
+    const orderId = String(orderRow.upstock_order_id);
+    const user = await getTradingUser();
+    const option = await db[MODEL.HEDGING_OPTIONS].findOne({
+        where: { instrument_key: instrumentKey },
+    });
+    const lotSize = Number(option?.lot_size) || 0;
+    const lotsExact = lotSize > 0 ? filledQty / lotSize : 0;
+    const lots = Math.round(lotsExact);
+    const wholeLots = lots >= 1 && Math.abs(lotsExact - lots) < 1e-6;
+    const active = await db[MODEL.POSITION].findOne({
+        where: { strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP, is_active: true },
+    });
+    let fillPrice = Number(averagePrice || 0);
+    if (!(fillPrice > 0)) {
+        const remote = user?.token
+            ? await get_upstox_order_details(user.token, orderId)
+            : null;
+        fillPrice = Number(remote?.average_price || option?.ltp || 0);
+    }
+
+    if (!option || !wholeLots || active || !(fillPrice > 0)) {
+        const sameInstrument =
+            active &&
+            (await db[MODEL.TRADE].findOne({
+                where: { position_id: active.id, instrument_key: instrumentKey },
+            }));
+        const cannot = !option
+            ? 'option not found in the database'
+            : !wholeLots
+              ? `filled quantity ${filledQty} is not a whole lot (lot size ${lotSize})`
+              : active
+                ? 'another Nifty trade is already open'
+                : 'no usable fill price';
+        await logNiftyAudit({
+            action: 'ORDER_ADOPTED',
+            reason: sameInstrument ? 'ADOPT_SKIPPED_SAME_INSTRUMENT' : 'ADOPT_IMPOSSIBLE',
+            instrumentKey,
+            config,
+            skipThrottle: true,
+            metadata: {
+                orderId,
+                filledQty,
+                cannot,
+                thinking: sameInstrument
+                    ? `Order ${orderId} filled ${filledQty} more of an instrument that is already an open trade. I cannot merge it safely: CHECK UPSTOX quantity.`
+                    : `Late BUY fill (${filledQty} qty) cannot become a managed trade: ${cannot}. Selling it back so no unmanaged position remains.`,
+            },
+        });
+        if (sameInstrument) {
+            await db[MODEL.UPSTOCK_ORDERS].update(
+                { purpose: 'ENTRY_ORPHAN_FAILED' },
+                { where: { id: orderRow.id } },
+            );
+            notifyNiftyEvent(
+                'LIVE_ORDER_FAIL',
+                'Late BUY fill on an open instrument — check Upstox quantity',
+                { orderId, instrumentKey, filledQty },
+            );
+            return false;
+        }
+        const flat = await flattenStrayQuantity({
+            user,
+            config,
+            instrumentKey,
+            quantity: filledQty,
+            why: `Late BUY fill ${orderId} could not be managed (${cannot}).`,
+        });
+        await db[MODEL.UPSTOCK_ORDERS].update(
+            { purpose: flat ? 'ENTRY_FLATTENED' : 'ENTRY_ORPHAN_FAILED' },
+            { where: { id: orderRow.id } },
+        );
+        return false;
+    }
+
+    const target = calculateTargetLtp(fillPrice, lots, lotSize, config);
+    const tradeRef = Math.floor(100000 + Math.random() * 900000);
+    const position = await db[MODEL.POSITION].create({
+        strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP,
+        is_active: true,
+        qty: lots,
+        trade_id: tradeRef,
+        date: moment().format('YYYY-MM-DD'),
+        start_time: moment(),
+        required_margin: fillPrice * lotSize * lots,
+        is_exectued: true,
+        is_upstock_exectued: true,
+    });
+    const trade = await db[MODEL.TRADE].create({
+        position_id: position.id,
+        options_chain_id: option.options_chain_id || option.id,
+        trade_id: String(tradeRef),
+        strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP,
+        trading_symbol: option.trading_symbol,
+        instrument_key: instrumentKey,
+        instrument_type: option.instrument_type,
+        trade_type: 'BUY',
+        buy_price: fillPrice,
+        target_price: target,
+        stop_loss: 0,
+        is_active: true,
+        ltp: Number(option.ltp) > 0 ? Number(option.ltp) : fillPrice,
+        qty: lots,
+        lot_size: lotSize,
+        highest_ltp: Math.max(fillPrice, Number(option.ltp) || 0),
+        original_qty: lots,
+        order_lifecycle: 'OPEN',
+        broker_confirmed: true,
+        entry_order_id: orderId,
+        exit_pending: false,
+        exit_retry_count: 0,
+        exit_halted: false,
+    });
+    await db[MODEL.UPSTOCK_ORDERS].update(
+        {
+            purpose: 'ENTRY',
+            trade_id: trade.id,
+            postion_id: position.id,
+        },
+        { where: { id: orderRow.id } },
+    );
+    const synced = await syncStrategyBalanceFromUpstox();
+    await recordTradeLeg({
+        trade,
+        legType: 'ENTRY',
+        side: 'BUY',
+        lots,
+        price: fillPrice,
+        reason: 'ADOPTED_LATE_FILL',
+        brokerOrderId: orderId,
+        mode: 'live',
+        avgBuyAfter: fillPrice,
+        qtyAfter: lots,
+        targetAfter: target,
+        metadata: { adopted: true },
+    });
+    await logNiftyAudit({
+        action: 'ORDER_ADOPTED',
+        reason: 'LATE_BUY_FILL_ADOPTED',
+        instrumentKey,
+        tradeId: trade.id,
+        engineState: 'IN_TRADE',
+        config,
+        skipThrottle: true,
+        metadata: {
+            orderId,
+            fillPrice,
+            lots,
+            target,
+            balance: synced,
+            thinking: `BUY ${orderId} had timed out earlier but Upstox filled it at ${fillPrice} (${lots} lot). I created the trade now, so the stop (${NIFTY_STOP_POINTS} pts), trailing and exit rules apply to it like any other trade.`,
+        },
+    });
+    notifyNiftyEvent(
+        'ENTRY_FILLED',
+        `Late BUY fill adopted ${option.trading_symbol} @ ${fillPrice}`,
+        { orderId, fillPrice, lots },
     );
     return true;
 };
@@ -348,6 +665,7 @@ export const openNiftyScalpEntry = async ({
     hedgeOption?: any;
 }) => {
     if (entryInProgress) return null;
+    if (getEntryCooldownRemainingMs() > 0) return null;
     entryInProgress = true;
 
     try {
@@ -427,6 +745,29 @@ export const openNiftyScalpEntry = async ({
         let hedgeOrderId: string | null = null;
         let brokerConfirmed = !liveMode;
 
+        await logNiftyAudit({
+            action: 'ENTRY_ATTEMPT',
+            reason,
+            signal,
+            instrumentKey: option.instrument_key,
+            engineState: 'ENTERING',
+            config,
+            indicators,
+            skipThrottle: true,
+            metadata: {
+                symbol: option.trading_symbol,
+                quoteLtp,
+                lotSize,
+                balance,
+                liveMode,
+                thinking: `Signal ${signal} accepted (${reason}). ${option.trading_symbol} quote ${quoteLtp}, cost for 1 lot ≈ ₹${(quoteLtp * lotSize).toFixed(0)}, balance ₹${balance.toFixed(0)}. Filters passed (trend, extension, volume, day limits). ${
+                    liveMode
+                        ? 'LIVE mode: sending a real BUY and waiting for Upstox to confirm.'
+                        : `PAPER mode: simulated fill at quote + ${NIFTY_PAPER_SPREAD_POINTS} spread.`
+                }`,
+            },
+        });
+
         if (liveMode) {
             const live = await placeConfirmedUpstoxOrder({
                 user,
@@ -435,9 +776,16 @@ export const openNiftyScalpEntry = async ({
                 quantity: lotSize * 1,
                 side: 'BUY',
                 purpose: 'ENTRY',
+                why: `${signal} entry (${reason}) on ${option.trading_symbol}, quote ${quoteLtp}.`,
             });
 
             if (!live.ok) {
+                startEntryCooldown();
+                const failText = live.timedOut
+                    ? live.stillPending
+                        ? 'The BUY timed out and Upstox has not settled the cancel yet. It is being watched and will be adopted if it fills.'
+                        : 'The BUY timed out and was cancelled.'
+                    : `Upstox rejected the BUY: ${errText(live.error || live.status)}.`;
                 await logNiftyAudit({
                     action: 'LIVE_ORDER_FAIL',
                     reason: live.timedOut
@@ -445,9 +793,14 @@ export const openNiftyScalpEntry = async ({
                         : 'ENTRY_BUY_FAILED',
                     signal,
                     instrumentKey: option.instrument_key,
+                    engineState: 'SCANNING',
                     config,
                     indicators,
-                    metadata: { live },
+                    metadata: {
+                        live,
+                        cooldownSec: ENTRY_FAIL_COOLDOWN_MS / 1000,
+                        thinking: `${failText} No trade was created. I will not try a new entry for ${ENTRY_FAIL_COOLDOWN_MS / 1000}s, so one rejected signal is not retried every second.`,
+                    },
                     skipThrottle: true,
                 });
                 return null;
@@ -600,9 +953,11 @@ export const openNiftyScalpEntry = async ({
                 brokerConfirmed,
                 hedgeFill: hasHedge ? hedgeFill : null,
                 hedgeKey: hasHedge ? hedgeOption.instrument_key : null,
-                thinking: liveMode
-                    ? `Upstox BUY confirmed @ ${fillPrice}${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. Target ${target.toFixed(2)}`
-                    : `Paper BUY @ ${fillPrice}${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. Target ${target.toFixed(2)}`,
+                thinking: `${
+                    liveMode
+                        ? `Upstox confirmed the BUY at ${fillPrice} (quote was ${quoteLtp}, slippage ${(fillPrice - quoteLtp).toFixed(2)} pts)`
+                        : `Paper BUY filled at ${fillPrice} (quote ${quoteLtp} + spread)`
+                }${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. Trade created and now managed by the engine: hard stop at ${(fillPrice - NIFTY_STOP_POINTS).toFixed(2)} (-${NIFTY_STOP_POINTS} pts), trailing arms at net ₹${config.target_profit_rs}, guide target ${target.toFixed(2)}.`,
             },
             skipThrottle: true,
         });
@@ -772,6 +1127,8 @@ export const closeNiftyScalpTrade = async ({
     exitReason: string;
 }) => {
     if (!trade?.is_active) return false;
+    const tradeKey = String(trade.id);
+
     if (trade.exit_halted) {
         notifyNiftyEvent(
             'LIVE_ORDER_FAIL',
@@ -781,11 +1138,96 @@ export const closeNiftyScalpTrade = async ({
         return false;
     }
 
+    // Only one exit attempt per trade at a time. The engine ticks every second
+    // and a SELL can take longer than that to confirm.
+    if (exitsInFlight.has(tradeKey)) {
+        await logNiftyAudit({
+            action: 'SAFETY_CHECK',
+            reason: 'EXIT_ALREADY_IN_FLIGHT',
+            instrumentKey: trade.instrument_key,
+            tradeId: trade.id,
+            config,
+            metadata: {
+                requestedReason: exitReason,
+                thinking: `Exit (${exitReason}) requested again, but a SELL for this trade is already being placed or confirmed. I will not send a second SELL: that could open a short position.`,
+            },
+        });
+        return false;
+    }
+
+    const notBefore = exitRetryNotBefore.get(tradeKey) || 0;
+    if (Date.now() < notBefore) {
+        const waitSec = Math.ceil((notBefore - Date.now()) / 1000);
+        await logNiftyAudit({
+            action: 'SAFETY_CHECK',
+            reason: 'EXIT_RETRY_BACKOFF',
+            instrumentKey: trade.instrument_key,
+            tradeId: trade.id,
+            config,
+            metadata: {
+                requestedReason: exitReason,
+                retries: trade.exit_retry_count,
+                waitSec,
+                thinking: `Exit (${exitReason}) is due but the last SELL failed. Waiting ${waitSec}s before attempt ${Number(trade.exit_retry_count || 0) + 1}. Position stays OPEN.`,
+            },
+        });
+        return false;
+    }
+
+    exitsInFlight.add(tradeKey);
+    try {
+        return await closeNiftyScalpTradeInner({
+            trade,
+            position,
+            config,
+            exitReason,
+        });
+    } finally {
+        exitsInFlight.delete(tradeKey);
+    }
+};
+
+const closeNiftyScalpTradeInner = async ({
+    trade,
+    position,
+    config,
+    exitReason,
+}: {
+    trade: any;
+    position: any;
+    config: NiftyScalpConfig;
+    exitReason: string;
+}) => {
     const user = await getTradingUser();
-    const liveMode = isLiveTradingEnabled(user, config);
+    const globalLive = isLiveTradingEnabled(user, config);
+    // The trade decides live vs paper, not the switch now: a live position must
+    // be sold at Upstox even if live was switched off, and a paper trade must
+    // never send a real SELL.
+    const entryPosition =
+        position ?? (await db[MODEL.POSITION].findByPk(trade.position_id));
+    const tradeWasLive = Boolean(entryPosition?.is_upstock_exectued);
+    const liveMode = tradeWasLive;
     const ltp = Number(trade.ltp);
     const qty = Number(trade.qty);
     const lotSize = Number(trade.lot_size);
+
+    if (tradeWasLive !== globalLive) {
+        await logNiftyAudit({
+            action: 'SAFETY_CHECK',
+            reason: 'MODE_MISMATCH_FOLLOWS_TRADE',
+            instrumentKey: trade.instrument_key,
+            tradeId: trade.id,
+            config,
+            metadata: {
+                tradeWasLive,
+                globalLive,
+                thinking: tradeWasLive
+                    ? 'This trade was bought LIVE but live trading is switched off now. It is still sold on Upstox, because the position really exists there.'
+                    : 'This trade was a PAPER trade but live trading is on now. It is closed as paper: no real SELL is sent for something that was never bought.',
+            },
+            skipThrottle: true,
+        });
+    }
 
     // Mark exit pending BEFORE placing sell — never pretend closed
     await trade.update({
@@ -805,6 +1247,14 @@ export const closeNiftyScalpTrade = async ({
         return true;
     }
 
+    const exitAudit = {
+        config,
+        instrumentKey: trade.instrument_key,
+        tradeId: trade.id,
+        purpose: 'EXIT',
+        side: 'SELL' as const,
+    };
+
     const sellHedgeIfAny = async () => {
         const hedgeKey = trade.hedge_instrument_key;
         const hedgeQty = Number(trade.hedge_qty || 0);
@@ -816,8 +1266,10 @@ export const closeNiftyScalpTrade = async ({
             quantity: lotSize * hedgeQty,
             side: 'SELL',
             purpose: 'EXIT',
-            positionId: position.id,
+            positionId: entryPosition?.id,
             tradeId: trade.id,
+            why: `Closing the legacy hedge leg together with the main leg (${exitReason}).`,
+            forceLive: true,
         });
         if (hedgeSell.ok) {
             await trade.update({
@@ -841,9 +1293,23 @@ export const closeNiftyScalpTrade = async ({
             return true;
         }
         if (existing && isOrderPending(existing.status)) {
+            await logNiftyAudit({
+                action: 'SAFETY_CHECK',
+                reason: 'RESUME_EXISTING_EXIT_ORDER',
+                instrumentKey: trade.instrument_key,
+                tradeId: trade.id,
+                config,
+                skipThrottle: true,
+                metadata: {
+                    orderId: trade.exit_order_id,
+                    status: existing.status,
+                    thinking: `A SELL (${trade.exit_order_id}) is already working at Upstox (status "${existing.status}"). Waiting on it instead of sending another.`,
+                },
+            });
             const resumed = await waitForOrderConfirmation({
                 orderId: String(trade.exit_order_id),
                 accessToken: user.token,
+                audit: exitAudit,
             });
             if (resumed.ok) {
                 await sellHedgeIfAny();
@@ -863,17 +1329,110 @@ export const closeNiftyScalpTrade = async ({
                 );
                 return false;
             }
-            // Rejected / cancelled → bump retry, clear id, then place fresh below
+            // Rejected / cancelled → count the retry, clear the id. The fresh
+            // SELL goes out on a later tick, after the backoff.
             if (resumed.rejected || isOrderRejected(resumed.status)) {
                 await markExitRetry(
                     trade,
                     resumed.error || resumed.status,
                     config,
                 );
-                const halted = await db[MODEL.TRADE].findByPk(trade.id);
-                if (halted?.exit_halted) return false;
                 await trade.update({ exit_order_id: null });
                 trade.exit_order_id = null;
+                return false;
+            }
+        }
+    }
+
+    // Safety: confirm the broker really holds what we are about to sell.
+    // A SELL on a position that is already flat (manual square-off, earlier
+    // fill) would open a naked short.
+    let sellQty = lotSize * qty;
+    const ageSec = (Date.now() - new Date(trade.createdAt).getTime()) / 1000;
+    if (user?.token && ageSec >= 90) {
+        const positions = await getUpstoxPositionsOrNull(user.token);
+        if (positions == null) {
+            await logNiftyAudit({
+                action: 'SAFETY_CHECK',
+                reason: 'POSITIONS_CHECK_UNAVAILABLE',
+                instrumentKey: trade.instrument_key,
+                tradeId: trade.id,
+                config,
+                metadata: {
+                    thinking:
+                        'Could not read positions from Upstox before selling. Exiting is more important than the check, so the SELL goes ahead.',
+                },
+            });
+        } else {
+            const brokerQty = positions
+                .filter((p) => p.instrument_key === trade.instrument_key)
+                .reduce((sum, p) => sum + Number(p.quantity || 0), 0);
+            if (brokerQty <= 0) {
+                const sellRow = await db[MODEL.UPSTOCK_ORDERS].findOne({
+                    where: {
+                        trade_id: trade.id,
+                        order_type: 'SELL',
+                        purpose: 'EXIT',
+                    },
+                    order: [['updatedAt', 'DESC']],
+                });
+                const filledSell =
+                    sellRow && isOrderFilled(sellRow.status) ? sellRow : null;
+                await logNiftyAudit({
+                    action: 'SAFETY_CHECK',
+                    reason:
+                        brokerQty === 0
+                            ? 'BROKER_ALREADY_FLAT'
+                            : 'BROKER_SHORT_DETECTED',
+                    instrumentKey: trade.instrument_key,
+                    tradeId: trade.id,
+                    config,
+                    skipThrottle: true,
+                    metadata: {
+                        brokerQty,
+                        expectedQty: sellQty,
+                        foundFilledSell: Boolean(filledSell),
+                        thinking:
+                            brokerQty === 0
+                                ? `Exit wanted (${exitReason}) but Upstox shows NO position in this instrument. Selling now would open a short, so no SELL is sent. ${filledSell ? `A SELL order (${filledSell.upstock_order_id}) did fill earlier at ${filledSell.average_price}: closing the trade with that price.` : 'It was probably squared off manually on Upstox: closing the trade record at the last price.'}`
+                                : `Upstox shows a NET SHORT (${brokerQty}) in this instrument. I will not sell more. CHECK UPSTOX NOW.`,
+                    },
+                });
+                if (brokerQty < 0) {
+                    notifyNiftyEvent(
+                        'LIVE_ORDER_FAIL',
+                        `Broker shows net short ${brokerQty} — check Upstox now`,
+                        { tradeId: trade.id, brokerQty },
+                    );
+                    return false;
+                }
+                await trade.update({
+                    pending_exit_reason: filledSell
+                        ? exitReason
+                        : 'BROKER_FLAT_MANUAL_SQUARE_OFF',
+                });
+                await finalizeNiftyExitAfterBrokerFill({
+                    trade,
+                    sellPrice: Number(filledSell?.average_price || ltp),
+                    orderId: filledSell?.upstock_order_id,
+                });
+                return true;
+            }
+            if (brokerQty < sellQty) {
+                await logNiftyAudit({
+                    action: 'SAFETY_CHECK',
+                    reason: 'BROKER_QTY_LOWER_THAN_DB',
+                    instrumentKey: trade.instrument_key,
+                    tradeId: trade.id,
+                    config,
+                    skipThrottle: true,
+                    metadata: {
+                        brokerQty,
+                        expectedQty: sellQty,
+                        thinking: `Upstox holds ${brokerQty} but the trade says ${sellQty}. Selling only ${brokerQty} so I never sell more than exists.`,
+                    },
+                });
+                sellQty = brokerQty;
             }
         }
     }
@@ -882,11 +1441,18 @@ export const closeNiftyScalpTrade = async ({
         user,
         config,
         instrumentKey: trade.instrument_key,
-        quantity: lotSize * qty,
+        quantity: sellQty,
         side: 'SELL',
         purpose: 'EXIT',
-        positionId: position.id,
+        positionId: entryPosition?.id,
         tradeId: trade.id,
+        why: `Exit rule ${exitReason}: LTP ${ltp}, bought ${Number(trade.buy_price)}.`,
+        forceLive: true,
+        // Save the order id at once so a restart or overlapping tick sees it.
+        onOrderPlaced: async (orderId) => {
+            await trade.update({ exit_order_id: orderId });
+            trade.exit_order_id = orderId;
+        },
     });
 
     if (live.ok && !live.paper) {
@@ -901,13 +1467,26 @@ export const closeNiftyScalpTrade = async ({
     }
 
     // Rejected / timeout / error → keep trade OPEN (NOT paper close)
-    if (live.orderId) {
-        await trade.update({ exit_order_id: live.orderId });
-    }
-    // Only bump retry counter on hard reject — timeout keeps waiting on same order
     if (live.rejected && !live.timedOut) {
+        await trade.update({ exit_order_id: null });
+        trade.exit_order_id = null;
         await markExitRetry(trade, live.error || live.status || live, config);
     } else if (live.timedOut) {
+        if (live.orderId) {
+            await trade.update({ exit_order_id: live.orderId });
+        }
+        await logNiftyAudit({
+            action: 'LIVE_ORDER_FAIL',
+            reason: 'EXIT_CONFIRM_TIMEOUT',
+            instrumentKey: trade.instrument_key,
+            tradeId: trade.id,
+            config,
+            skipThrottle: true,
+            metadata: {
+                orderId: live.orderId,
+                thinking: `The SELL ${live.orderId} was not confirmed in 25s. It is still working at Upstox, so the trade stays OPEN and the next tick keeps waiting on the SAME order (no second SELL).`,
+            },
+        });
         notifyNiftyEvent(
             'LIVE_ORDER_FAIL',
             'Exit confirm timeout — trade stays OPEN until Upstox fills or rejects',
@@ -1383,6 +1962,7 @@ export const manualOpenNiftyScalpEntry = async ({
                 quantity: lotSize * qty,
                 side: 'BUY',
                 purpose: 'ENTRY',
+                why: `Manual entry from the frontend: ${qty} lot(s) of ${option.trading_symbol}.`,
             });
 
             if (!live.ok) {

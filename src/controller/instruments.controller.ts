@@ -33,7 +33,11 @@ import {
     getTradeLegCounts,
     getTradeLegsByTradeKey,
 } from '../helpers/nifty.scalp.leg.helper';
-import { hedgeLegView } from '../helpers/nifty.scalp.trade.helper';
+import {
+    hasActiveNiftyTrade,
+    hedgeLegView,
+} from '../helpers/nifty.scalp.trade.helper';
+import { logNiftyAudit } from '../helpers/nifty.scalp.audit.helper';
 import { getNiftyScalpConfig } from '../helpers/nifty.scalp.config.helper';
 const csv = require('csv-parser');
 
@@ -1289,6 +1293,24 @@ class InstrumentsController {
             });
 
             const is_live = find_order.is_live ? false : true;
+
+            // Never flip live/paper under an open Nifty trade.
+            if (await hasActiveNiftyTrade()) {
+                await logNiftyAudit({
+                    action: 'MODE_TOGGLE',
+                    reason: 'TOGGLE_BLOCKED_OPEN_TRADE',
+                    skipThrottle: true,
+                    metadata: {
+                        requested: is_live ? 'live' : 'paper',
+                        thinking: `Switch to ${is_live ? 'LIVE' : 'PAPER'} refused: a Nifty trade is open. Close it first so a real position is never closed as paper.`,
+                    },
+                });
+                return res.status(409).json({
+                    status: RES_STATUS.UPDATE,
+                    message:
+                        'A Nifty trade is open. Close it before switching between paper and live.',
+                });
+            }
 
             await db[MODEL.USER].update(
                 {

@@ -8,9 +8,13 @@ export interface UpstoxPosition {
     trading_symbol?: string;
 }
 
-export const getUpstoxPositions = async (
+/**
+ * Strict variant: returns null when the positions call FAILED.
+ * An empty array here really means "broker is flat".
+ */
+export const getUpstoxPositionsOrNull = async (
     accessToken: string,
-): Promise<UpstoxPosition[]> => {
+): Promise<UpstoxPosition[] | null> => {
     try {
         const response = await axios.get(
             'https://api.upstox.com/v2/portfolio/short-term-positions',
@@ -19,6 +23,7 @@ export const getUpstoxPositions = async (
                     Accept: 'application/json',
                     Authorization: `Bearer ${accessToken}`,
                 },
+                timeout: 10000,
             },
         );
         const data = response.data?.data ?? [];
@@ -33,6 +38,12 @@ export const getUpstoxPositions = async (
             'getUpstoxPositions failed',
             error?.response?.data || error?.message,
         );
-        return [];
+        return null;
     }
 };
+
+/** Legacy variant used by the older scalping strategy: [] on failure. */
+export const getUpstoxPositions = async (
+    accessToken: string,
+): Promise<UpstoxPosition[]> =>
+    (await getUpstoxPositionsOrNull(accessToken)) ?? [];
