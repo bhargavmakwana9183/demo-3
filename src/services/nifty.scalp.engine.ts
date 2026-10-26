@@ -24,6 +24,9 @@ import {
     NIFTY_SOFT_LOSS_RS,
     NIFTY_SPOT_FLIP_MIN_MINUTES,
     NIFTY_STOP_POINTS,
+    NIFTY_TRAIL_ARM_RS,
+    NIFTY_BREAKEVEN_ARM_RS,
+    NIFTY_BREAKEVEN_FLOOR_RS,
     NIFTY_TRAIL_FLOOR_RS,
     NIFTY_TRAIL_MAX_MINUTES,
     NIFTY_TRAIL_POINTS,
@@ -321,6 +324,51 @@ export class NiftyScalpEngine {
             return 'IN_TRADE';
         }
 
+        const ageMin =
+            (Date.now() - new Date(trade.createdAt).getTime()) / 60000;
+        const netAtPrice = (price: number) =>
+            calculateGrossPl(price, avgBuy, qty, lotSize) - charges + hedgeNet;
+        const peakNet = netAtPrice(highest);
+        const trailArmed = peakNet >= NIFTY_TRAIL_ARM_RS;
+        const breakevenArmed = !trailArmed && peakNet >= NIFTY_BREAKEVEN_ARM_RS;
+        const breakevenPrice = priceForNet(
+            avgBuy,
+            qty,
+            lotSize,
+            config,
+            NIFTY_BREAKEVEN_FLOOR_RS,
+            hedgeNet,
+        );
+        const trailFloorPrice = priceForNet(
+            avgBuy,
+            qty,
+            lotSize,
+            config,
+            NIFTY_TRAIL_FLOOR_RS,
+            hedgeNet,
+        );
+        const trailStop = Math.max(highest - NIFTY_TRAIL_POINTS, trailFloorPrice);
+        const hardStop = avgBuy - NIFTY_STOP_POINTS;
+        const protection = trailArmed
+            ? `Stage 3 TRAILING (peak net ₹${peakNet.toFixed(0)} ≥ ₹${NIFTY_TRAIL_ARM_RS}): exit at ${trailStop.toFixed(2)} = max(peak ${highest} − ${NIFTY_TRAIL_POINTS}, floor ${trailFloorPrice.toFixed(2)} for +₹${NIFTY_TRAIL_FLOOR_RS})`
+            : breakevenArmed
+              ? `Stage 2 BREAKEVEN (peak net ₹${peakNet.toFixed(0)} ≥ ₹${NIFTY_BREAKEVEN_ARM_RS}): exit if price falls to ${breakevenPrice.toFixed(2)} (net ₹${NIFTY_BREAKEVEN_FLOOR_RS}); trailing starts at net ₹${NIFTY_TRAIL_ARM_RS}`
+              : `Stage 1 INITIAL: hard stop ${hardStop.toFixed(2)} (−${NIFTY_STOP_POINTS} pts); breakeven protection starts at net ₹${NIFTY_BREAKEVEN_ARM_RS}, trailing at ₹${NIFTY_TRAIL_ARM_RS}`;
+
+        await this.recordStopMove({
+            trade,
+            config,
+            stage: trailArmed ? 'TRAILING' : breakevenArmed ? 'BREAKEVEN' : 'INITIAL',
+            newStop: trailArmed ? trailStop : breakevenArmed ? breakevenPrice : hardStop,
+            ltp,
+            avgBuy,
+            highest,
+            peakNet,
+            netPl,
+            breakevenPrice,
+            trailFloorPrice,
+        });
+
         await logNiftyAudit({
             action: 'HOLD',
             reason: 'MONITORING_TARGET',
@@ -337,16 +385,13 @@ export class NiftyScalpEngine {
                 hedgeNet,
                 netPl,
                 pointsFromAvg: Number((ltp - avgBuy).toFixed(2)),
-                thinking: `Holding ${qty} lot(s). LTP ${ltp}, avg ${avgBuy}, guideTarget ${target.toFixed(2)}, combinedNet≈${netPl.toFixed(2)} (main≈${mainNet.toFixed(2)}, hedge≈${hedgeNet.toFixed(2)})`,
+                highest,
+                peakNet: Number(peakNet.toFixed(2)),
+                stage: trailArmed ? 'TRAILING' : breakevenArmed ? 'BREAKEVEN' : 'INITIAL',
+                thinking: `Holding ${qty} lot(s). LTP ${ltp}, bought ${avgBuy}, peak ${highest}, open net ₹${netPl.toFixed(2)}. ${protection}.`,
             },
         });
 
-        const ageMin =
-            (Date.now() - new Date(trade.createdAt).getTime()) / 60000;
-        const netAtPrice = (price: number) =>
-            calculateGrossPl(price, avgBuy, qty, lotSize) - charges + hedgeNet;
-        const peakNet = netAtPrice(highest);
-        const trailArmed = peakNet >= config.target_profit_rs;
 
         const exitNow = async (
             exitReason: string,
@@ -398,21 +443,12 @@ export class NiftyScalpEngine {
             );
         }
 
-        // 4. Trailing exit once net profit has reached the target.
+        // 4. Trailing exit once peak net profit reached NIFTY_TRAIL_ARM_RS.
         if (trailArmed) {
-            const floorPrice = priceForNet(
-                avgBuy,
-                qty,
-                lotSize,
-                config,
-                NIFTY_TRAIL_FLOOR_RS,
-                hedgeNet,
-            );
-            const trailStop = Math.max(highest - NIFTY_TRAIL_POINTS, floorPrice);
             if (ltp <= trailStop) {
                 return exitNow(
                     'TRAIL_PROFIT_EXIT',
-                    `trailing stop hit: price ${ltp} fell to the trail level ${trailStop.toFixed(2)} (peak ${highest} minus ${NIFTY_TRAIL_POINTS} pts, floor ${floorPrice.toFixed(2)}) after the trade had reached the profit target`,
+                    `trailing stop hit: price ${ltp} fell to the trail level ${trailStop.toFixed(2)} (the higher of peak ${highest} − ${NIFTY_TRAIL_POINTS} pts and the +₹${NIFTY_TRAIL_FLOOR_RS} floor ${trailFloorPrice.toFixed(2)}); peak net was ₹${peakNet.toFixed(0)}`,
                 );
             }
             if (ageMin >= NIFTY_TRAIL_MAX_MINUTES) {
@@ -422,6 +458,14 @@ export class NiftyScalpEngine {
                 );
             }
         } else {
+            // 4b. Breakeven protection: a trade that was ₹200 up must not become a loss.
+            if (breakevenArmed && ltp <= breakevenPrice) {
+                return exitNow(
+                    'BREAKEVEN_EXIT',
+                    `the trade was up ₹${peakNet.toFixed(0)} at its peak (${highest}) but fell back to the breakeven price ${breakevenPrice.toFixed(2)} before reaching the ₹${NIFTY_TRAIL_ARM_RS} trailing level, so I exit flat instead of letting a winner turn into a loss`,
+                );
+            }
+
             // 5. No follow-through: never reached +N points within M minutes.
             if (
                 ageMin >= NIFTY_NO_FOLLOW_MINUTES &&
@@ -472,6 +516,110 @@ export class NiftyScalpEngine {
 
         // One lot per trade: no averaging down, no Plan B.
         return 'IN_TRADE';
+    }
+
+    /** Last stop level written to the audit log, per trade. */
+    private lastStopLogged = new Map<string, { stop: number; stage: string }>();
+
+    /**
+     * The stop only moves up. Saves the current stop on the trade (shown in
+     * positions) and writes a STOP_UPDATED audit row when the stop is first
+     * set, when the stage changes, or when it has risen ≥ STOP_LOG_STEP_POINTS
+     * since the last row (so a rise of 0.05 per tick does not flood the log).
+     */
+    private static readonly STOP_LOG_STEP_POINTS = 0.5;
+
+    private async recordStopMove(input: {
+        trade: any;
+        config: Awaited<ReturnType<typeof getNiftyScalpConfig>>;
+        stage: 'INITIAL' | 'BREAKEVEN' | 'TRAILING';
+        newStop: number;
+        ltp: number;
+        avgBuy: number;
+        highest: number;
+        peakNet: number;
+        netPl: number;
+        breakevenPrice: number;
+        trailFloorPrice: number;
+    }) {
+        const { trade, config, stage, ltp, avgBuy, highest, peakNet, netPl } = input;
+        const newStop = Number(input.newStop.toFixed(2));
+        const savedStop = Number(trade.stop_loss || 0);
+        const key = String(trade.id);
+
+        // Stage the saved stop belongs to (survives a restart).
+        const savedStage =
+            savedStop <= 0
+                ? 'NONE'
+                : savedStop >= input.trailFloorPrice - 0.01
+                  ? 'TRAILING'
+                  : savedStop >= input.breakevenPrice - 0.01
+                    ? 'BREAKEVEN'
+                    : 'INITIAL';
+        const last = this.lastStopLogged.get(key) ?? {
+            stop: savedStop,
+            stage: savedStage,
+        };
+
+        if (savedStop > 0 && newStop <= savedStop + 0.004) return;
+
+        await trade.update({ stop_loss: newStop });
+        trade.stop_loss = newStop;
+
+        const stageChanged = last.stage !== stage;
+        const roseEnough =
+            newStop - last.stop >= NiftyScalpEngine.STOP_LOG_STEP_POINTS;
+        if (!stageChanged && !roseEnough && last.stage !== 'NONE') return;
+
+        this.lastStopLogged.set(key, { stop: newStop, stage });
+        const lotSize = Number(trade.lot_size);
+        const qty = Number(trade.qty);
+        const lockedNet =
+            (newStop - avgBuy) * lotSize * qty -
+            calculateRoundTripCharges(qty, lotSize, avgBuy, config);
+
+        let thinking: string;
+        if (last.stage === 'NONE' || savedStop <= 0) {
+            thinking = `Initial stop set at ${newStop} (entry ${avgBuy} − ${NIFTY_STOP_POINTS} pts). Worst case if hit ≈ ₹${lockedNet.toFixed(0)} net.`;
+        } else if (stageChanged && stage === 'BREAKEVEN') {
+            thinking = `Peak net reached ₹${peakNet.toFixed(0)} (≥ ₹${NIFTY_BREAKEVEN_ARM_RS}), so the stop moved UP from ${last.stop} to breakeven ${newStop}. This trade can no longer turn into a loss (apart from slippage).`;
+        } else if (stageChanged && stage === 'TRAILING') {
+            thinking = `Peak net reached ₹${peakNet.toFixed(0)} (≥ ₹${NIFTY_TRAIL_ARM_RS}), so trailing started: stop moved UP from ${last.stop} to ${newStop}, which locks about ₹${lockedNet.toFixed(0)} net. From here it follows the peak − ${NIFTY_TRAIL_POINTS} pts.`;
+        } else {
+            thinking = `New high ${highest}: trailing stop moved UP from ${last.stop} to ${newStop} (peak − ${NIFTY_TRAIL_POINTS} pts), now locking about ₹${lockedNet.toFixed(0)} net.`;
+        }
+
+        await logNiftyAudit({
+            action: 'STOP_UPDATED',
+            reason:
+                last.stage === 'NONE' || savedStop <= 0
+                    ? 'STOP_INITIAL'
+                    : stageChanged
+                      ? `STOP_TO_${stage}`
+                      : 'STOP_TRAILED_UP',
+            instrumentKey: trade.instrument_key,
+            tradeId: trade.id,
+            engineState: 'IN_TRADE',
+            config,
+            skipThrottle: true,
+            metadata: {
+                stage,
+                oldStop: last.stop || null,
+                newStop,
+                ltp,
+                avgBuy,
+                highest,
+                peakNet: Number(peakNet.toFixed(2)),
+                openNet: Number(netPl.toFixed(2)),
+                lockedNet: Number(lockedNet.toFixed(2)),
+                thinking,
+            },
+        });
+        notifyNiftyEvent(
+            'STOP_UPDATED',
+            `Stop ${stage === 'INITIAL' ? 'set' : 'moved up'} to ${newStop} (${stage})`,
+            { tradeId: trade.id, newStop, stage },
+        );
     }
 
     /** 1-minute Nifty trend check, cached for a few seconds so ticks do not hammer the DB. */
@@ -642,6 +790,38 @@ export class NiftyScalpEngine {
             return 'SCANNING';
         }
 
+        // One trade per signal candle. The feed delivers the last COMPLETED
+        // 1-minute candle, so the same cross stays "true" for a whole minute.
+        // Any trade opened after that candle closed has already used it.
+        const signalCandleTs = Number(signal.indicators?.signalCandleTs || 0);
+        if (signalCandleTs > 0) {
+            const candleClosedAt = new Date(signalCandleTs + 60_000);
+            const usedBy = await db[MODEL.TRADE].findOne({
+                where: {
+                    strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP,
+                    createdAt: { [Op.gte]: candleClosedAt },
+                },
+                order: [['createdAt', 'DESC']],
+            });
+            if (usedBy) {
+                await logNiftyAudit({
+                    action: 'SKIP',
+                    reason: 'SIGNAL_CANDLE_ALREADY_TRADED',
+                    signal: signal.signal,
+                    instrumentKey: signal.instrument.instrument_key,
+                    engineState: 'SCANNING',
+                    config,
+                    indicators: signal.indicators,
+                    metadata: {
+                        signalCandle: moment(signalCandleTs).format('HH:mm'),
+                        usedByTrade: usedBy.trade_id,
+                        thinking: `${signal.signal} is still showing, but it comes from the ${moment(signalCandleTs).format('HH:mm')} candle, which trade ${usedBy.trade_id} already traded. Waiting for a NEW cross instead of re-entering on the same signal.`,
+                    },
+                });
+                return 'SCANNING';
+            }
+        }
+
         await openNiftyScalpEntry({
             option: signal.instrument,
             hedgeOption: signal.hedgeInstrument,
@@ -681,6 +861,8 @@ export class NiftyScalpEngine {
                 stop_points: NIFTY_STOP_POINTS,
                 trail_points: NIFTY_TRAIL_POINTS,
                 trail_floor_rs: NIFTY_TRAIL_FLOOR_RS,
+                trail_arm_rs: NIFTY_TRAIL_ARM_RS,
+                breakeven_arm_rs: NIFTY_BREAKEVEN_ARM_RS,
                 profit_cap_rs: NIFTY_PROFIT_CAP_RS,
                 daily_max_loss_rs: NIFTY_DAILY_MAX_LOSS_RS,
                 daily_profit_lock_rs: NIFTY_DAILY_PROFIT_LOCK_RS,

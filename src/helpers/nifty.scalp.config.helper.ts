@@ -125,9 +125,19 @@ export const NIFTY_SOFT_LOSS_RS = 1200;
 export const NIFTY_NO_FOLLOW_MINUTES = 4;
 export const NIFTY_NO_FOLLOW_POINTS = 2;
 
-/** Trailing exit. Arms once net profit reaches target_profit_rs. */
+/**
+ * Profit protection, two steps:
+ *  1. Peak net ≥ NIFTY_BREAKEVEN_ARM_RS → a winner may not turn into a loss
+ *     (exit if net falls back to NIFTY_BREAKEVEN_FLOOR_RS).
+ *  2. Peak net ≥ NIFTY_TRAIL_ARM_RS → trailing stop: the higher of
+ *     peak − NIFTY_TRAIL_POINTS and the price that keeps NIFTY_TRAIL_FLOOR_RS.
+ * The gap between arm and floor is the room a winner gets before the stop bites.
+ */
+export const NIFTY_BREAKEVEN_ARM_RS = 200;
+export const NIFTY_BREAKEVEN_FLOOR_RS = 0;
+export const NIFTY_TRAIL_ARM_RS = 300;
 export const NIFTY_TRAIL_POINTS = 6;
-/** Once armed, never give back below this net profit (₹). */
+/** Once the trail is armed, never give back below this net profit (₹). */
 export const NIFTY_TRAIL_FLOOR_RS = 150;
 /** Close at this net profit (₹) even if still rising. */
 export const NIFTY_PROFIT_CAP_RS = 800;

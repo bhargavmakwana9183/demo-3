@@ -33,7 +33,8 @@ export type NiftyAuditAction =
     | 'ORDER_ADOPTED'
     | 'SAFETY_CHECK'
     | 'PRICE_CORRECTED'
-    | 'MODE_TOGGLE';
+    | 'MODE_TOGGLE'
+    | 'STOP_UPDATED';
 
 const lastTickLogAt = new Map<string, number>();
 const TICK_THROTTLE_MS = 8_000;
@@ -77,6 +78,7 @@ export const logNiftyAudit = async (input: {
         'ORDER_ADOPTED',
         'PRICE_CORRECTED',
         'MODE_TOGGLE',
+        'STOP_UPDATED',
         'RECONCILE',
     ].includes(input.action);
 

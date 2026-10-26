@@ -30,6 +30,7 @@ export type NiftySignalResult = {
         spot5mSlow?: number;
         volume5m?: number;
         extensionPct?: number;
+        signalCandleTs?: number;
     };
     instrument?: any;
     hedgeInstrument?: any;
@@ -95,6 +96,8 @@ const evaluateOptionCandles = async (
         rsi: lastRSI,
         volume5m,
         extensionPct: Number(extensionPct.toFixed(4)),
+        // Start (epoch ms) of the completed candle the cross was read from.
+        signalCandleTs: Number(candlesDesc[0]?.ts) || undefined,
     };
 
     const rawSignal: 'CE_BUY' | 'PE_BUY' | null =
