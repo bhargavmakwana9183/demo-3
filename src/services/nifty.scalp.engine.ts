@@ -38,6 +38,7 @@ import {
 } from '../helpers/nifty.scalp.config.helper';
 import {
     evaluateNiftyOptionSignal,
+    explainSignal,
     spotTrendAllows,
 } from '../helpers/nifty.scalp.signal.helper';
 import {
@@ -778,7 +779,8 @@ export class NiftyScalpEngine {
                 expiry,
                 balance,
                 hedgeKey: signal.hedgeInstrument?.instrument_key,
-                thinking: `Signal=${signal.signal}. Reason=${signal.reason}`,
+                sides: signal.sides,
+                thinking: explainSignal(signal),
             },
         });
 

@@ -34,7 +34,76 @@ export type NiftySignalResult = {
     };
     instrument?: any;
     hedgeInstrument?: any;
+    /** Per-side verdict and numbers, so the audit never mixes CE and PE values. */
+    sides?: Partial<Record<'CE' | 'PE', NiftySideSummary>>;
 };
+
+export type NiftySideSummary = {
+    symbol?: string;
+    reason: string;
+    ema9?: number;
+    ema21?: number;
+    rsi?: number;
+    extensionPct?: number;
+    volume5m?: number;
+    trend?: Record<string, number>;
+};
+
+const round2 = (v: unknown) =>
+    Number.isFinite(Number(v)) ? Number(Number(v).toFixed(2)) : undefined;
+
+const summarizeSide = (
+    result: NiftySignalResult,
+    reason: string,
+    trend?: Record<string, number>,
+): NiftySideSummary => ({
+    symbol: result.instrument?.trading_symbol,
+    reason,
+    ema9: round2(result.indicators.ema9),
+    ema21: round2(result.indicators.ema21),
+    rsi: round2(result.indicators.rsi),
+    extensionPct: result.indicators.extensionPct,
+    volume5m: result.indicators.volume5m,
+    trend: trend
+        ? Object.fromEntries(
+              Object.entries(trend).map(([k, v]) => [k, round2(v) as number]),
+          )
+        : undefined,
+});
+
+const describeSideReason = (side: 'CE' | 'PE', s: NiftySideSummary) => {
+    const r = s.reason;
+    const t = s.trend ?? {};
+    if (/^NO_(CE|PE)_EMA_CROSS$/.test(r)) return 'no fresh EMA9/21 cross up on the premium';
+    if (r.endsWith('_SKIP_EXTENDED_FROM_EMA9'))
+        return `crossed up, but price is ${((s.extensionPct ?? 0) * 100).toFixed(2)}% from EMA9 (chasing)`;
+    if (r.endsWith('_SKIP_LOW_VOLUME'))
+        return `crossed up, but 5-candle volume ${s.volume5m} is too thin`;
+    if (r.startsWith('SPOT_1M_TREND_BLOCKS'))
+        return `crossed up, but Nifty 1m trend disagrees (EMA9 ${t.spotEma9} vs EMA21 ${t.spotEma21}; ${side} needs Nifty ${side === 'CE' ? 'rising' : 'falling'})`;
+    if (r.startsWith('SPOT_5M_TREND_BLOCKS'))
+        return `crossed up, but Nifty 5m trend disagrees (EMA5 ${t.spot5mFast} vs EMA13 ${t.spot5mSlow}; ${side} needs Nifty ${side === 'CE' ? 'rising' : 'falling'})`;
+    if (r.endsWith('_CANDLES_INSUFFICIENT')) return 'not enough candles yet';
+    return r;
+};
+
+/** Plain-language summary of a signal evaluation for the audit log. */
+export const explainSignal = (result: NiftySignalResult): string => {
+    if (result.signal !== 'NONE') {
+        return `${result.signal}: ${result.instrument?.trading_symbol ?? ''} premium crossed EMA9 above EMA21 with RSI ${round2(result.indicators.rsi)}, extension ${((result.indicators.extensionPct ?? 0) * 100).toFixed(2)}%, and Nifty 1m + 5m trend agree. (${result.reason})`;
+    }
+    if (!result.sides) return `No trade: ${result.reason}`;
+    const parts = (['CE', 'PE'] as const)
+        .filter((side) => result.sides?.[side])
+        .map((side) => {
+            const s = result.sides![side]!;
+            return `${side} ${s.symbol ?? ''} (EMA9 ${s.ema9}, EMA21 ${s.ema21}, RSI ${s.rsi}): ${describeSideReason(side, s)}`;
+        });
+    return `No trade. ${parts.join('. ')}.`;
+};
+
+/** A side that got past "no cross" is the more interesting one to show. */
+const crossed = (reason: string) => !/^NO_(CE|PE)_EMA_CROSS$/.test(reason);
 
 const optionLotSize = (option: any) =>
     Number(option?.lot_size || option?.minimum_lot) || 0;
@@ -100,20 +169,19 @@ const evaluateOptionCandles = async (
         signalCandleTs: Number(candlesDesc[0]?.ts) || undefined,
     };
 
-    const rawSignal: 'CE_BUY' | 'PE_BUY' | null =
-        side === 'CE' &&
+    // These are the option's own premium candles, and we only ever BUY.
+    // A PE premium rises when Nifty falls, so both sides need the premium
+    // crossing UP with healthy (not overbought) momentum.
+    const premiumCrossUp =
         lastEMA9 > lastEMA21 &&
         prevEMA9 <= prevEMA21 &&
         lastRSI > 45 &&
-        lastRSI < config.rsi_ce_max
+        lastRSI < config.rsi_ce_max;
+    const rawSignal: 'CE_BUY' | 'PE_BUY' | null = premiumCrossUp
+        ? side === 'CE'
             ? 'CE_BUY'
-            : side === 'PE' &&
-                lastEMA9 < lastEMA21 &&
-                prevEMA9 >= prevEMA21 &&
-                lastRSI < 55 &&
-                lastRSI > config.rsi_pe_min
-              ? 'PE_BUY'
-              : null;
+            : 'PE_BUY'
+        : null;
 
     if (rawSignal) {
         // Skip chasing: price already far from its 9 EMA.
@@ -136,10 +204,7 @@ const evaluateOptionCandles = async (
         }
         return {
             signal: rawSignal,
-            reason:
-                rawSignal === 'CE_BUY'
-                    ? 'CE_EMA_CROSS_UP_RSI_OK'
-                    : 'PE_EMA_CROSS_DOWN_RSI_OK',
+            reason: `${side}_EMA_CROSS_UP_RSI_OK`,
             indicators,
             instrument,
         };
@@ -402,14 +467,19 @@ export const evaluateNiftyOptionSignal = async (
               indicators: {},
           };
 
+    let ceReason = ceSignal.reason;
+    let ceTrend: Record<string, number> | undefined;
+
     if (ceSignal.signal === 'CE_BUY') {
         const trend = await spotTrendAllowsAll(
             config.underlying_instrument_key,
             'CE',
             config,
         );
+        ceTrend = trend.indicators;
         if (!trend.ok) {
-            // fall through to PE
+            // Still check PE, but remember why CE was refused.
+            ceReason = `${trend.reason}_BLOCKS_CE`;
         } else {
             const hedge = NIFTY_HEDGE_ENABLED
                 ? await findHedgeOption({
@@ -474,13 +544,14 @@ export const evaluateNiftyOptionSignal = async (
             config,
         );
         if (!trend.ok) {
+            const peReason = `${trend.reason}_BLOCKS_PE`;
             return {
                 signal: 'NONE',
-                reason: `${trend.reason}_BLOCKS_PE|${ceSignal.reason}`,
-                indicators: {
-                    ...ceSignal.indicators,
-                    ...peSignal.indicators,
-                    ...trend.indicators,
+                reason: `${ceReason}|${peReason}`,
+                indicators: { ...peSignal.indicators, ...trend.indicators },
+                sides: {
+                    CE: summarizeSide(ceSignal, ceReason, ceTrend),
+                    PE: summarizeSide(peSignal, peReason, trend.indicators),
                 },
             };
         }
@@ -531,12 +602,19 @@ export const evaluateNiftyOptionSignal = async (
         };
     }
 
+    // The flat indicator columns show ONE side: the one that actually
+    // crossed (and was then filtered), else CE. Both sides live in `sides`.
+    const focusPe = crossed(peSignal.reason) && !crossed(ceReason);
+    const focus = focusPe
+        ? peSignal.indicators
+        : { ...ceSignal.indicators, ...(ceTrend ?? {}) };
     return {
         signal: 'NONE',
-        reason: `${ceSignal.reason}|${peSignal.reason}`,
-        indicators: {
-            ...ceSignal.indicators,
-            ...peSignal.indicators,
+        reason: `${ceReason}|${peSignal.reason}`,
+        indicators: focus,
+        sides: {
+            CE: summarizeSide(ceSignal, ceReason, ceTrend),
+            PE: summarizeSide(peSignal, peSignal.reason),
         },
     };
 };
