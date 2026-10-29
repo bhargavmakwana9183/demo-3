@@ -28,7 +28,7 @@ cron.schedule(
     { timezone: 'Asia/Kolkata' },
 );
 
-// Morning: load current/upcoming expiry into hedging_options_details
+// Morning: trade expiry (full) + next week's ATM band so Tuesday EMAs are warm
 cron.schedule(
     '30 8 * * 1-5',
     async () => {

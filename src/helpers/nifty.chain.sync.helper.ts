@@ -1,5 +1,4 @@
 import axios from 'axios';
-import moment from 'moment';
 import { Op } from 'sequelize';
 import {
     INDEXES,
@@ -10,8 +9,10 @@ import {
 } from '../constant';
 import { db } from '../model';
 import { logger } from '../logger/logger';
-import { get_upcoming_expiry_date } from './stock.helper';
+import { getNiftyExpiryPlan } from './nifty.expiry.helper';
+import { resubscribeNiftyMarketFeed } from './nifty.market.subscribe.helper';
 import { logNiftyAudit } from './nifty.scalp.audit.helper';
+import { NIFTY_WARMUP_STRIKE_STEPS } from './nifty.scalp.config.helper';
 
 const NIFTY_INSTRUMENT_KEY = INDEXES.NIFTY_50;
 const NIFTY_NAME = INDEXES_NAMES.NIFTY_50;
@@ -73,29 +74,57 @@ export const syncNiftyOptionChain = async (): Promise<{
     return { inserted, skipped, deletedExpired: 0 };
 };
 
-export const syncNiftyHedgingOptions = async (): Promise<{
-    expiry: string | null;
-    inserted: number;
-    skipped: number;
-    deleted: number;
-}> => {
-    const expiry = await get_upcoming_expiry_date(NIFTY_NAME);
-    if (!expiry) {
-        logger.warn('No upcoming Nifty expiry found in option_chain_details');
-        return { expiry: null, inserted: 0, skipped: 0, deleted: 0 };
-    }
+const hedgingFieldsFromChain = (data: any) => ({
+    options_chain_id: data.id,
+    name: data.name,
+    segment: data.segment,
+    exchange: data.exchange,
+    expiry: data.expiry,
+    weekly: data.weekly,
+    instrument_key: data.instrument_key,
+    exchange_token: data.exchange_token,
+    trading_symbol: data.trading_symbol,
+    tick_size: data.tick_size,
+    lot_size: data.lot_size,
+    instrument_type: data.instrument_type,
+    freeze_quantity: data.freeze_quantity,
+    underlying_type: data.underlying_type,
+    underlying_key: data.underlying_key,
+    underlying_symbol: data.underlying_symbol,
+    strike_price: data.strike_price,
+    ltp: data.ltp || 0,
+    minimum_lot: data.minimum_lot,
+});
 
-    const chainRows = await db[MODEL.OPTIONS_CHAINS].findAll({
-        where: {
-            name: NIFTY_NAME,
-            expiry,
-        },
+const lastNiftySpot = async (): Promise<number | null> => {
+    const row = await db[MODEL.CANDELS].findOne({
+        where: { instrument_key: INDEXES.NIFTY_50 },
+        order: [['ts', 'DESC']],
     });
+    const close = Number(row?.close);
+    return Number.isFinite(close) && close > 0 ? close : null;
+};
 
+const upsertHedgingExpiry = async (
+    expiry: string,
+    keepStrikes?: { atm: number; step: number; steps: number },
+): Promise<{ inserted: number; skipped: number }> => {
+    const chainRows = await db[MODEL.OPTIONS_CHAINS].findAll({
+        where: { name: NIFTY_NAME, expiry },
+    });
     let inserted = 0;
     let skipped = 0;
-
     for (const data of chainRows) {
+        if (keepStrikes) {
+            const strike = Number(data.strike_price);
+            if (
+                !Number.isFinite(strike) ||
+                Math.abs(strike - keepStrikes.atm) >
+                    keepStrikes.steps * keepStrikes.step
+            ) {
+                continue;
+            }
+        }
         const existing = await db[MODEL.HEDGING_OPTIONS].findOne({
             where: { instrument_key: data.instrument_key },
         });
@@ -103,55 +132,130 @@ export const syncNiftyHedgingOptions = async (): Promise<{
             skipped += 1;
             continue;
         }
-        await db[MODEL.HEDGING_OPTIONS].create({
-            options_chain_id: data.id,
-            name: data.name,
-            segment: data.segment,
-            exchange: data.exchange,
-            expiry: data.expiry,
-            weekly: data.weekly,
-            instrument_key: data.instrument_key,
-            exchange_token: data.exchange_token,
-            trading_symbol: data.trading_symbol,
-            tick_size: data.tick_size,
-            lot_size: data.lot_size,
-            instrument_type: data.instrument_type,
-            freeze_quantity: data.freeze_quantity,
-            underlying_type: data.underlying_type,
-            underlying_key: data.underlying_key,
-            underlying_symbol: data.underlying_symbol,
-            strike_price: data.strike_price,
-            ltp: data.ltp || 0,
-            minimum_lot: data.minimum_lot,
-        });
+        await db[MODEL.HEDGING_OPTIONS].create(hedgingFieldsFromChain(data));
         inserted += 1;
     }
+    return { inserted, skipped };
+};
 
-    // Only purge hedging_options_details (never option_chain / trade / position)
-    const today = moment().startOf('day').format('YYYY-MM-DD');
-    const deleted = await db[MODEL.HEDGING_OPTIONS].destroy({
+export const syncNiftyHedgingOptions = async (): Promise<{
+    expiry: string | null;
+    tradeExpiry: string | null;
+    subscribeExpiries: string[];
+    isExpiryDay: boolean;
+    inserted: number;
+    skipped: number;
+    deleted: number;
+}> => {
+    const plan = await getNiftyExpiryPlan();
+    if (!plan.tradeExpiry || plan.subscribeExpiries.length === 0) {
+        logger.warn('No upcoming Nifty expiry found in option_chain_details');
+        return {
+            expiry: null,
+            tradeExpiry: null,
+            subscribeExpiries: [],
+            isExpiryDay: false,
+            inserted: 0,
+            skipped: 0,
+            deleted: 0,
+        };
+    }
+
+    const spot = await lastNiftySpot();
+    const step = 50;
+    const atm = spot != null ? Math.round(spot / step) * step : null;
+
+    let inserted = 0;
+    let skipped = 0;
+    for (const expiry of plan.subscribeExpiries) {
+        const isTrade = expiry === plan.tradeExpiry;
+        const band =
+            !isTrade && atm != null
+                ? { atm, step, steps: NIFTY_WARMUP_STRIKE_STEPS }
+                : undefined;
+        const part = await upsertHedgingExpiry(expiry, band);
+        inserted += part.inserted;
+        skipped += part.skipped;
+    }
+
+    const openTrades = (await db[MODEL.TRADE].findAll({
         where: {
-            name: NIFTY_NAME,
-            [Op.or]: [
-                { expiry: { [Op.ne]: expiry } },
-                { expiry: { [Op.lt]: today } },
-            ],
+            strategy_name: STRATEGY.NIFTY_OPTIONS_SCALP,
+            is_active: true,
         },
+        attributes: ['instrument_key'],
+        raw: true,
+    })) as { instrument_key?: string }[];
+    const keepKeys = openTrades
+        .map((t) => t.instrument_key)
+        .filter(Boolean) as string[];
+
+    const extraWhere: Record<string, unknown>[] = [
+        { expiry: { [Op.notIn]: plan.subscribeExpiries } },
+        { expiry: { [Op.lt]: plan.today } },
+    ];
+    if (atm != null && plan.subscribeExpiries.length > 1) {
+        const warmup = plan.subscribeExpiries.filter(
+            (e) => e !== plan.tradeExpiry,
+        );
+        const maxDist = NIFTY_WARMUP_STRIKE_STEPS * step;
+        extraWhere.push({
+            expiry: { [Op.in]: warmup },
+            strike_price: {
+                [Op.or]: [
+                    { [Op.lt]: atm - maxDist },
+                    { [Op.gt]: atm + maxDist },
+                ],
+            },
+        });
+    }
+
+    const purgeWhere: Record<string, unknown> = {
+        name: NIFTY_NAME,
+        [Op.or]: extraWhere,
+    };
+    if (keepKeys.length) {
+        purgeWhere.instrument_key = { [Op.notIn]: keepKeys };
+    }
+    const deleted = await db[MODEL.HEDGING_OPTIONS].destroy({
+        where: purgeWhere,
         force: true,
     });
 
     await logNiftyAudit({
         action: 'HEDGING_SYNC',
-        reason: `Hedging options synced for expiry ${expiry}`,
-        metadata: { expiry, inserted, skipped, deleted },
+        reason: plan.isExpiryDay
+            ? `Expiry day: trading ${plan.tradeExpiry} (not ${plan.nearestExpiry}). Feed also keeps ${plan.subscribeExpiries.join(', ')}`
+            : `Hedging options synced for trade expiry ${plan.tradeExpiry} (feed ${plan.subscribeExpiries.join(', ')})`,
+        metadata: {
+            expiry: plan.tradeExpiry,
+            tradeExpiry: plan.tradeExpiry,
+            nearestExpiry: plan.nearestExpiry,
+            subscribeExpiries: plan.subscribeExpiries,
+            isExpiryDay: plan.isExpiryDay,
+            inserted,
+            skipped,
+            deleted,
+            warmupAtm: atm,
+        },
         engineState: 'SYNC',
     });
 
     logger.info(
-        `Nifty hedging sync expiry=${expiry}: inserted=${inserted}, skipped=${skipped}, deletedHedging=${deleted}`,
+        `Nifty hedging sync trade=${plan.tradeExpiry} feed=[${plan.subscribeExpiries.join(',')}]: inserted=${inserted}, skipped=${skipped}, deletedHedging=${deleted}`,
     );
 
-    return { expiry, inserted, skipped, deleted };
+    await resubscribeNiftyMarketFeed();
+
+    return {
+        expiry: plan.tradeExpiry,
+        tradeExpiry: plan.tradeExpiry,
+        subscribeExpiries: plan.subscribeExpiries,
+        isExpiryDay: plan.isExpiryDay,
+        inserted,
+        skipped,
+        deleted,
+    };
 };
 
 export const ensureNiftyStrategyRecords = async () => {

@@ -6,8 +6,13 @@ import { logger } from '../logger/logger';
 import {
     current_strike_price,
     getCurrentISTDate,
-    get_upcoming_expiry_date,
 } from '../helpers/stock.helper';
+import {
+    expiryForInstrument,
+    getNiftyExpiryPlan,
+    mustNotCarryOvernight,
+    optionExpiresToday,
+} from '../helpers/nifty.expiry.helper';
 import { buildMarketTime, canOpenNewTrade } from '../helpers/scalping.risk.helper';
 import {
     NIFTY_BREAKEVEN_ARM_RS,
@@ -115,6 +120,37 @@ export class NiftyScalpEngine {
         const position = await this.getActivePosition();
 
         if (currentISTDate < startTime || currentISTDate > endTime) {
+            if (position) {
+                const overnightTrade = await this.getActiveTrade(position.id);
+                const optionExpiry = overnightTrade
+                    ? await expiryForInstrument(overnightTrade.instrument_key)
+                    : null;
+                if (
+                    overnightTrade &&
+                    mustNotCarryOvernight(optionExpiry, formattedDate)
+                ) {
+                    await logNiftyAudit({
+                        action: 'EXIT_DECISION',
+                        reason: 'EOD_BEFORE_EXPIRY',
+                        tradeId: overnightTrade.id,
+                        instrumentKey: overnightTrade.instrument_key,
+                        engineState: 'EXITING',
+                        config,
+                        skipThrottle: true,
+                        metadata: {
+                            optionExpiry,
+                            thinking: `This option expires ${optionExpiry}. I will not carry it into expiry day, so I flatten now.`,
+                        },
+                    });
+                    await closeNiftyScalpTrade({
+                        trade: overnightTrade,
+                        position,
+                        config,
+                        exitReason: 'EOD_BEFORE_EXPIRY',
+                    });
+                    return 'SCANNING';
+                }
+            }
             if (position && config.enable_overnight_carry) {
                 if (this.lastCarryLogDate !== formattedDate) {
                     this.lastCarryLogDate = formattedDate;
@@ -141,6 +177,34 @@ export class NiftyScalpEngine {
         }
 
         if (position) {
+            const openTrade = await this.getActiveTrade(position.id);
+            if (openTrade) {
+                const optionExpiry = await expiryForInstrument(
+                    openTrade.instrument_key,
+                );
+                if (optionExpiresToday(optionExpiry, formattedDate)) {
+                    await logNiftyAudit({
+                        action: 'EXIT_DECISION',
+                        reason: 'EXPIRY_DAY_FLAT_THIS_WEEK',
+                        tradeId: openTrade.id,
+                        instrumentKey: openTrade.instrument_key,
+                        engineState: 'EXITING',
+                        config,
+                        skipThrottle: true,
+                        metadata: {
+                            optionExpiry,
+                            thinking: `This option expires today (${optionExpiry}). Expiry-day entries use next week only, so I flatten this-week leftover now.`,
+                        },
+                    });
+                    await closeNiftyScalpTrade({
+                        trade: openTrade,
+                        position,
+                        config,
+                        exitReason: 'EXPIRY_DAY_FLAT_THIS_WEEK',
+                    });
+                    return 'SCANNING';
+                }
+            }
             return this.manageOpenPosition(position, config, currentISTDate);
         }
 
@@ -423,23 +487,32 @@ export class NiftyScalpEngine {
 
         const formattedDate = currentISTDate.toISOString().slice(0, 10);
         const eodCheck = buildMarketTime(formattedDate, EOD_CHECK_TIME);
-        if (currentISTDate >= eodCheck && trade.eod_decision !== 'CARRY') {
-            if (netPl >= 0) {
-                await closeNiftyScalpTrade({
-                    trade,
-                    position,
-                    config,
-                    exitReason: 'EOD_1510_NOT_IN_LOSS',
-                });
-                return 'SCANNING';
-            }
-            if (netPl <= -EOD_LOSS_CHOICE_RS && trade.eod_decision !== 'REQUIRED') {
-                await trade.update({ eod_decision: 'REQUIRED' });
-                notifyNiftyEvent(
-                    'EOD_DECISION',
-                    `Loss ₹${Math.abs(netPl).toFixed(0)} after 3:10. Choose carry or manual sell.`,
-                    { tradeId: trade.id, netPl },
+        if (currentISTDate >= eodCheck) {
+            const optionExpiry = await expiryForInstrument(trade.instrument_key);
+            if (mustNotCarryOvernight(optionExpiry, formattedDate)) {
+                return exitNow(
+                    'EOD_BEFORE_EXPIRY',
+                    `this option expires ${optionExpiry}, so I flatten at 15:10 and do not carry it into expiry day`,
                 );
+            }
+            if (trade.eod_decision !== 'CARRY') {
+                if (netPl >= 0) {
+                    await closeNiftyScalpTrade({
+                        trade,
+                        position,
+                        config,
+                        exitReason: 'EOD_1510_NOT_IN_LOSS',
+                    });
+                    return 'SCANNING';
+                }
+                if (netPl <= -EOD_LOSS_CHOICE_RS && trade.eod_decision !== 'REQUIRED') {
+                    await trade.update({ eod_decision: 'REQUIRED' });
+                    notifyNiftyEvent(
+                        'EOD_DECISION',
+                        `Loss ₹${Math.abs(netPl).toFixed(0)} after 3:10. Choose carry or manual sell.`,
+                        { tradeId: trade.id, netPl },
+                    );
+                }
             }
         }
 
@@ -619,19 +692,26 @@ export class NiftyScalpEngine {
             return 'SCANNING';
         }
 
-        const expiry = await get_upcoming_expiry_date(INDEXES_NAMES.NIFTY_50);
-        const expiryDay = expiry ? moment(expiry).format('YYYY-MM-DD') : '';
-        const expiryCutoff = buildMarketTime(
-            formattedDate,
-            EXPIRY_NO_NEW_ENTRY_AFTER,
-        );
-        if (expiryDay === formattedDate && currentISTDate >= expiryCutoff) {
+        const expiryPlan = await getNiftyExpiryPlan(formattedDate);
+        const expiry = expiryPlan.tradeExpiry;
+        // Safety only: if we were still pointing at today's expiry, stop new
+        // entries at 11:30. Next-week contracts use the normal 14:30 cutoff.
+        if (
+            expiryPlan.isExpiryDay &&
+            expiry === formattedDate &&
+            currentISTDate >=
+                buildMarketTime(formattedDate, EXPIRY_NO_NEW_ENTRY_AFTER)
+        ) {
             await logNiftyAudit({
                 action: 'SKIP',
                 reason: 'EXPIRY_DAY_AFTER_1130_NO_NEW_ENTRY',
                 engineState: 'SCANNING',
                 config,
-                metadata: { expiry: expiryDay },
+                metadata: {
+                    expiry,
+                    thinking:
+                        'Still on today\'s expiry (next week missing). No new entries after 11:30.',
+                },
             });
             return 'SCANNING';
         }
@@ -705,10 +785,14 @@ export class NiftyScalpEngine {
             metadata: {
                 spot,
                 expiry,
+                isExpiryDay: expiryPlan.isExpiryDay,
+                nearestExpiry: expiryPlan.nearestExpiry,
                 balance,
                 hedgeKey: signal.hedgeInstrument?.instrument_key,
                 sides: signal.sides,
-                thinking: explainSignal(signal),
+                thinking: expiryPlan.isExpiryDay
+                    ? `${explainSignal(signal)} Expiry day: trading ${expiry}, not today's ${expiryPlan.nearestExpiry}.`
+                    : explainSignal(signal),
             },
         });
 
@@ -774,7 +858,7 @@ export class NiftyScalpEngine {
         const hedgingCount = await db[MODEL.HEDGING_OPTIONS].count({
             where: { name: INDEXES_NAMES.NIFTY_50 },
         });
-        const expiry = await get_upcoming_expiry_date(INDEXES_NAMES.NIFTY_50);
+        const expiryPlan = await getNiftyExpiryPlan();
 
         return {
             strategy: STRATEGY.NIFTY_OPTIONS_SCALP,
@@ -801,7 +885,11 @@ export class NiftyScalpEngine {
                 daily_max_trades: NIFTY_DAILY_MAX_TRADES,
             },
             balance,
-            expiry,
+            expiry: expiryPlan.tradeExpiry,
+            nearestExpiry: expiryPlan.nearestExpiry,
+            tradeExpiry: expiryPlan.tradeExpiry,
+            subscribeExpiries: expiryPlan.subscribeExpiries,
+            isExpiryDay: expiryPlan.isExpiryDay,
             hedgingCount,
             position,
             trade,

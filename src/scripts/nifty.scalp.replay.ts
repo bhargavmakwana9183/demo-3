@@ -39,6 +39,7 @@ import {
     niftyDayStats,
     planNiftyExit,
 } from '../helpers/nifty.scalp.rules';
+import { getNiftyExpiryPlan } from '../helpers/nifty.expiry.helper';
 
 type Candle = { ts: number; open: number; high: number; low: number; close: number; volume: number };
 type Option = { key: string; symbol: string; strike: number; type: 'CE' | 'PE'; lotSize: number };
@@ -147,13 +148,9 @@ type DayData = {
 };
 
 const loadDay = async (day: string): Promise<DayData | null> => {
-    const chain = await db[MODEL.OPTIONS_CHAINS].findOne({
-        where: { name: INDEXES_NAMES.NIFTY_50, expiry: { [Op.gte]: day } },
-        order: [['expiry', 'ASC']],
-        raw: true,
-    });
-    if (!chain) return null;
-    const expiry = String((chain as any).expiry).slice(0, 10);
+    const plan = await getNiftyExpiryPlan(day);
+    const expiry = plan.tradeExpiry;
+    if (!expiry) return null;
     const rows = (await db[MODEL.OPTIONS_CHAINS].findAll({
         where: { name: INDEXES_NAMES.NIFTY_50, expiry },
         raw: true,

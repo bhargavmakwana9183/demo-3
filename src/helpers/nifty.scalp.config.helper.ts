@@ -163,6 +163,8 @@ export const NIFTY_SPOT_5M_SLOW = 13;
 export const NIFTY_MAX_EXTENSION_PCT = 0.03;
 /** Skip when summed volume of the last 5 one-minute candles is below this. */
 export const NIFTY_MIN_VOLUME_5M = 500000;
+/** Non-trade expiry kept on the feed so next week's EMA is warm by Tuesday. ATM ± this many 50-pt strikes. */
+export const NIFTY_WARMUP_STRIKE_STEPS = 8;
 
 /** Day-level protection. */
 export const NIFTY_DAILY_MAX_CONSECUTIVE_LOSSES = 2;

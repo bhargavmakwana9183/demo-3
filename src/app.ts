@@ -18,11 +18,7 @@ import * as UpstoxClient from 'upstox-js-sdk';
 import protobuf from 'protobufjs';
 import { db } from './model';
 import { Server } from 'socket.io';
-import {
-    INDEXES,
-    INDEXES_NAMES,
-    USER_DETAILS,
-} from './constant/response.types';
+import { USER_DETAILS } from './constant/response.types';
 import { strategyController } from './controller';
 import './config/restart.json';
 import cron from 'node-cron';
@@ -45,6 +41,8 @@ import {
 import { getNiftyScalpConfig } from './helpers/nifty.scalp.config.helper';
 import { setNiftyNotifyEmitter } from './helpers/nifty.scalp.notify.helper';
 import { ensureNiftyStrategyRecords } from './helpers/nifty.chain.sync.helper';
+import { getNiftyMarketSubscribeKeys } from './helpers/nifty.expiry.helper';
+import { setNiftyMarketResubscribe } from './helpers/nifty.market.subscribe.helper';
 import { handleNiftyOrderStatusUpdate } from './helpers/nifty.scalp.order.helper';
 import './utils/nifty.reconciliation.cron';
 
@@ -84,6 +82,7 @@ class AppServer {
         ensureNiftyStrategyRecords().catch((err) =>
             logger.error(`ensureNiftyStrategyRecords: ${err.message}`),
         );
+        setNiftyMarketResubscribe(() => this.subscribeNiftyMarketFeed());
         this.io.on('connection', async (socket) => {
             // Immediate snapshot so Positions page has live LTP/P-L right away
             try {
@@ -239,37 +238,14 @@ class AppServer {
             });
             ws.on('open', () => {
                 console.log('connected');
+                this.marketWs = ws;
                 resolve(ws);
-                setTimeout(async () => {
-                    // Subscribe all current-expiry Nifty hedging options (+ index)
-                    const options = await db[MODEL.HEDGING_OPTIONS].findAll({
-                        where: { name: INDEXES_NAMES.NIFTY_50 },
-                    });
-
-                    const instrumentKeys = options.map(
-                        (option) => option.instrument_key,
-                    );
-                    const instrument_data_keys = [
-                        ...new Set(
-                            [...instrumentKeys, INDEXES.NIFTY_50].filter(
-                                Boolean,
-                            ),
+                setTimeout(() => {
+                    this.subscribeNiftyMarketFeed().catch((err) =>
+                        logger.error(
+                            `Nifty market subscribe: ${err?.message || err}`,
                         ),
-                    ];
-                    console.log(
-                        'Subscribing instruments:',
-                        instrument_data_keys.length,
                     );
-                    const data = {
-                        typr: '',
-                        guid: 'someguid',
-                        method: 'sub',
-                        data: {
-                            mode: 'full',
-                            instrumentKeys: instrument_data_keys,
-                        },
-                    };
-                    ws.send(Buffer.from(JSON.stringify(data)));
                 }, 1000);
             });
             ws.on('close', () => {
@@ -303,6 +279,28 @@ class AppServer {
                 reject(error);
             });
         });
+    }
+
+    /** Subscribe trade expiry (full) + next-week warmup keys already in hedging_options. */
+    private async subscribeNiftyMarketFeed() {
+        const ws = this.marketWs;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const instrumentKeys = await getNiftyMarketSubscribeKeys();
+        logger.info(`Subscribing instruments: ${instrumentKeys.length}`);
+        console.log('Subscribing instruments:', instrumentKeys.length);
+        ws.send(
+            Buffer.from(
+                JSON.stringify({
+                    typr: '',
+                    guid: 'someguid',
+                    method: 'sub',
+                    data: {
+                        mode: 'full',
+                        instrumentKeys,
+                    },
+                }),
+            ),
+        );
     }
 
     private async emitTodayTrades() {
