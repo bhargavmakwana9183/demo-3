@@ -108,25 +108,36 @@ const crossed = (reason: string) => !/^NO_(CE|PE)_EMA_CROSS$/.test(reason);
 const optionLotSize = (option: any) =>
     Number(option?.lot_size || option?.minimum_lot) || 0;
 
-const evaluateOptionCandles = async (
+/**
+ * Tunable entry thresholds. The live engine always uses the defaults; the
+ * replay tool overrides them to test changes on stored days.
+ */
+export type NiftySignalParams = {
+    maxExtensionPct: number;
+    minVolume5m: number;
+    /** Points the Nifty 1m EMA9 may sit on the wrong side of EMA21 and still count as agreeing. */
+    spot1mTolerancePts: number;
+    /** Same for the 5m EMA5 vs EMA13. */
+    spot5mTolerancePts: number;
+};
+
+export const DEFAULT_NIFTY_SIGNAL_PARAMS: NiftySignalParams = {
+    maxExtensionPct: NIFTY_MAX_EXTENSION_PCT,
+    minVolume5m: NIFTY_MIN_VOLUME_5M,
+    spot1mTolerancePts: 0,
+    spot5mTolerancePts: 0,
+};
+
+type CandleLike = { ts: number | string; close: number | string; volume?: number | string };
+
+/** Entry check for one option from its 1m candles (newest first). No DB access. */
+export const optionSignalFromCandles = (
     instrument: any,
+    candlesDesc: CandleLike[],
     side: 'CE' | 'PE',
     config: NiftyScalpConfig,
-): Promise<NiftySignalResult> => {
-    if (!instrument?.instrument_key) {
-        return {
-            signal: 'NONE',
-            reason: `${side}_INSTRUMENT_MISSING`,
-            indicators: {},
-        };
-    }
-
-    const candlesDesc = await db[MODEL.CANDELS].findAll({
-        where: { instrument_key: instrument.instrument_key },
-        order: [['ts', 'DESC']],
-        limit: 100,
-    });
-
+    params: NiftySignalParams = DEFAULT_NIFTY_SIGNAL_PARAMS,
+): NiftySignalResult => {
     if (candlesDesc.length < config.min_candles_1m) {
         return {
             signal: 'NONE',
@@ -185,7 +196,7 @@ const evaluateOptionCandles = async (
 
     if (rawSignal) {
         // Skip chasing: price already far from its 9 EMA.
-        if (extensionPct > NIFTY_MAX_EXTENSION_PCT) {
+        if (extensionPct > params.maxExtensionPct) {
             return {
                 signal: 'NONE',
                 reason: `${side}_SKIP_EXTENDED_FROM_EMA9`,
@@ -194,7 +205,7 @@ const evaluateOptionCandles = async (
             };
         }
         // Skip thin options (wide spreads, bad fills).
-        if (volume5m < NIFTY_MIN_VOLUME_5M) {
+        if (volume5m < params.minVolume5m) {
             return {
                 signal: 'NONE',
                 reason: `${side}_SKIP_LOW_VOLUME`,
@@ -218,49 +229,58 @@ const evaluateOptionCandles = async (
     };
 };
 
-/** Spot trend: CE only when fast EMA above slow; PE only when below. */
-export const spotTrendAllows = async (
-    spotKey: string,
+const evaluateOptionCandles = async (
+    instrument: any,
     side: 'CE' | 'PE',
     config: NiftyScalpConfig,
-): Promise<{ ok: boolean; indicators: Record<string, number> }> => {
+): Promise<NiftySignalResult> => {
+    if (!instrument?.instrument_key) {
+        return {
+            signal: 'NONE',
+            reason: `${side}_INSTRUMENT_MISSING`,
+            indicators: {},
+        };
+    }
     const candlesDesc = await db[MODEL.CANDELS].findAll({
-        where: { instrument_key: spotKey },
+        where: { instrument_key: instrument.instrument_key },
         order: [['ts', 'DESC']],
         limit: 100,
     });
-    if (candlesDesc.length < config.min_candles_1m) {
+    return optionSignalFromCandles(instrument, candlesDesc, side, config);
+};
+
+/** Nifty 1m trend from closes (oldest first). CE needs EMA9 ≥ EMA21, PE needs ≤. */
+export const spotTrend1mFromCloses = (
+    closesAsc: number[],
+    side: 'CE' | 'PE',
+    config: NiftyScalpConfig,
+    tolerancePts = 0,
+): { ok: boolean; indicators: Record<string, number> } => {
+    if (closesAsc.length < config.min_candles_1m) {
         return { ok: true, indicators: {} };
     }
-    const closes = candlesDesc.map((c) => Number(c.close)).reverse();
-    const ema9 = EMA.calculate({ period: config.ema_fast, values: closes });
-    const ema21 = EMA.calculate({ period: config.ema_slow, values: closes });
+    const ema9 = EMA.calculate({ period: config.ema_fast, values: closesAsc });
+    const ema21 = EMA.calculate({ period: config.ema_slow, values: closesAsc });
     const last9 = ema9[ema9.length - 1];
     const last21 = ema21[ema21.length - 1];
     const indicators = { spotEma9: last9, spotEma21: last21 };
-    if (side === 'CE') return { ok: last9 >= last21, indicators };
-    return { ok: last9 <= last21, indicators };
+    if (side === 'CE') return { ok: last9 >= last21 - tolerancePts, indicators };
+    return { ok: last9 <= last21 + tolerancePts, indicators };
 };
 
 /**
- * 5-minute Nifty trend built from stored 1-minute spot candles.
- * CE needs fast EMA >= slow EMA; PE needs fast <= slow.
- * Passes (but flags it) while there are too few bars, e.g. right after a restart.
+ * Nifty 5m trend built from 1m candles (oldest first): the last close of each
+ * 5-minute bucket. Passes (but flags it) while there are too few bars.
  */
-export const spotTrend5mAllows = async (
-    spotKey: string,
+export const spotTrend5mFromCandles = (
+    candlesAsc: CandleLike[],
     side: 'CE' | 'PE',
-): Promise<{ ok: boolean; insufficient: boolean; indicators: Record<string, number> }> => {
-    const candlesDesc = await db[MODEL.CANDELS].findAll({
-        where: { instrument_key: spotKey },
-        order: [['ts', 'DESC']],
-        limit: 500,
-    });
+    tolerancePts = 0,
+): { ok: boolean; insufficient: boolean; indicators: Record<string, number> } => {
     const bucketMs = 5 * 60 * 1000;
     const buckets = new Map<number, number>();
-    for (const c of [...candlesDesc].reverse()) {
-        const bucket = Math.floor(Number(c.ts) / bucketMs);
-        buckets.set(bucket, Number(c.close));
+    for (const c of candlesAsc) {
+        buckets.set(Math.floor(Number(c.ts) / bucketMs), Number(c.close));
     }
     const closes = [...buckets.entries()]
         .sort((a, b) => a[0] - b[0])
@@ -274,10 +294,89 @@ export const spotTrend5mAllows = async (
     const lastSlow = slow[slow.length - 1];
     const indicators = { spot5mFast: lastFast, spot5mSlow: lastSlow };
     return {
-        ok: side === 'CE' ? lastFast >= lastSlow : lastFast <= lastSlow,
+        ok:
+            side === 'CE'
+                ? lastFast >= lastSlow - tolerancePts
+                : lastFast <= lastSlow + tolerancePts,
         insufficient: false,
         indicators,
     };
+};
+
+/** 1m and 5m Nifty trend must both agree with the side. */
+export const spotTrendAllFromCandles = (
+    candlesAsc: CandleLike[],
+    side: 'CE' | 'PE',
+    config: NiftyScalpConfig,
+    params: NiftySignalParams = DEFAULT_NIFTY_SIGNAL_PARAMS,
+): { ok: boolean; reason: string; indicators: Record<string, number> } => {
+    const oneMin = spotTrend1mFromCloses(
+        candlesAsc.slice(-100).map((c) => Number(c.close)),
+        side,
+        config,
+        params.spot1mTolerancePts,
+    );
+    if (!oneMin.ok) {
+        return { ok: false, reason: 'SPOT_1M_TREND', indicators: oneMin.indicators };
+    }
+    const fiveMin = spotTrend5mFromCandles(
+        candlesAsc.slice(-500),
+        side,
+        params.spot5mTolerancePts,
+    );
+    return {
+        ok: fiveMin.ok,
+        reason: 'SPOT_5M_TREND',
+        indicators: { ...oneMin.indicators, ...fiveMin.indicators },
+    };
+};
+
+/**
+ * Same side order as evaluateNiftyOptionSignal: CE first; if CE has no signal
+ * or the Nifty trend refuses it, try PE. No DB access.
+ */
+export const pickNiftyEntrySide = (
+    ceSignal: NiftySignalResult,
+    peSignal: NiftySignalResult,
+    spotCandlesAsc: CandleLike[],
+    config: NiftyScalpConfig,
+    params: NiftySignalParams = DEFAULT_NIFTY_SIGNAL_PARAMS,
+): { side: 'CE' | 'PE' | null; reason: string } => {
+    let ceReason = ceSignal.reason;
+    if (ceSignal.signal === 'CE_BUY') {
+        const trend = spotTrendAllFromCandles(spotCandlesAsc, 'CE', config, params);
+        if (trend.ok) return { side: 'CE', reason: ceSignal.reason };
+        ceReason = `${trend.reason}_BLOCKS_CE`;
+    }
+    if (peSignal.signal === 'PE_BUY') {
+        const trend = spotTrendAllFromCandles(spotCandlesAsc, 'PE', config, params);
+        if (trend.ok) return { side: 'PE', reason: peSignal.reason };
+        return { side: null, reason: `${ceReason}|${trend.reason}_BLOCKS_PE` };
+    }
+    return { side: null, reason: `${ceReason}|${peSignal.reason}` };
+};
+
+const spotCandlesAsc = async (spotKey: string, limit: number) =>
+    (
+        await db[MODEL.CANDELS].findAll({
+            where: { instrument_key: spotKey },
+            order: [['ts', 'DESC']],
+            limit,
+        })
+    ).reverse();
+
+/** Spot trend: CE only when fast EMA above slow; PE only when below. */
+export const spotTrendAllows = async (
+    spotKey: string,
+    side: 'CE' | 'PE',
+    config: NiftyScalpConfig,
+): Promise<{ ok: boolean; indicators: Record<string, number> }> => {
+    const candles = await spotCandlesAsc(spotKey, 100);
+    return spotTrend1mFromCloses(
+        candles.map((c) => Number(c.close)),
+        side,
+        config,
+    );
 };
 
 /** 1-minute and 5-minute Nifty trend must both agree with the side. */
@@ -285,18 +384,8 @@ export const spotTrendAllowsAll = async (
     spotKey: string,
     side: 'CE' | 'PE',
     config: NiftyScalpConfig,
-): Promise<{ ok: boolean; reason: string; indicators: Record<string, number> }> => {
-    const oneMin = await spotTrendAllows(spotKey, side, config);
-    if (!oneMin.ok) {
-        return { ok: false, reason: 'SPOT_1M_TREND', indicators: oneMin.indicators };
-    }
-    const fiveMin = await spotTrend5mAllows(spotKey, side);
-    return {
-        ok: fiveMin.ok,
-        reason: 'SPOT_5M_TREND',
-        indicators: { ...oneMin.indicators, ...fiveMin.indicators },
-    };
-};
+): Promise<{ ok: boolean; reason: string; indicators: Record<string, number> }> =>
+    spotTrendAllFromCandles(await spotCandlesAsc(spotKey, 500), side, config);
 
 /** Nearest listed strike to ATM for one side (ATM first, then ±1..3 steps). */
 const findNearestListed = async (

@@ -961,7 +961,7 @@ export const openNiftyScalpEntry = async ({
                     liveMode
                         ? `Upstox confirmed the BUY at ${fillPrice} (quote was ${quoteLtp}, slippage ${(fillPrice - quoteLtp).toFixed(2)} pts)`
                         : `Paper BUY filled at ${fillPrice} (quote ${quoteLtp} + spread)`
-                }${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. Trade created and now managed by the engine: hard stop at ${(fillPrice - NIFTY_STOP_POINTS).toFixed(2)} (-${NIFTY_STOP_POINTS} pts), breakeven protection from net ₹${NIFTY_BREAKEVEN_ARM_RS}, trailing stop from net ₹${NIFTY_TRAIL_ARM_RS} (peak − ${NIFTY_TRAIL_POINTS} pts, never below +₹${NIFTY_TRAIL_FLOOR_RS}).`,
+                }${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. Trade created and now managed by the engine: hard stop at ${(fillPrice - NIFTY_STOP_POINTS).toFixed(2)} (-${NIFTY_STOP_POINTS} pts), breakeven protection from net ₹${NIFTY_BREAKEVEN_ARM_RS} (1-minute close, or a fast drop), trailing stop from net ₹${NIFTY_TRAIL_ARM_RS} (peak − ${NIFTY_TRAIL_POINTS} pts, never below +₹${NIFTY_TRAIL_FLOOR_RS}).`,
             },
             skipThrottle: true,
         });

@@ -126,16 +126,24 @@ export const NIFTY_NO_FOLLOW_MINUTES = 4;
 export const NIFTY_NO_FOLLOW_POINTS = 2;
 
 /**
- * Profit protection, two steps:
+ * Profit protection, two steps. Arms are in rupees of *net* P/L (after
+ * charges). One Nifty lot is 65, so ₹400 ≈ 8 points of premium — larger
+ * than a typical 1-minute swing, so a winner is not shaken out by noise.
  *  1. Peak net ≥ NIFTY_BREAKEVEN_ARM_RS → a winner may not turn into a loss
- *     (exit if net falls back to NIFTY_BREAKEVEN_FLOOR_RS).
+ *     (exit if a 1-minute candle closes back at NIFTY_BREAKEVEN_FLOOR_RS,
+ *     or at once if price drops NIFTY_BREAKEVEN_FAST_DROP_POINTS under it).
  *  2. Peak net ≥ NIFTY_TRAIL_ARM_RS → trailing stop: the higher of
  *     peak − NIFTY_TRAIL_POINTS and the price that keeps NIFTY_TRAIL_FLOOR_RS.
- * The gap between arm and floor is the room a winner gets before the stop bites.
+ * Trail must arm *after* breakeven, so trailArmRs > breakevenArmRs.
  */
-export const NIFTY_BREAKEVEN_ARM_RS = 200;
+export const NIFTY_BREAKEVEN_ARM_RS = 400;
 export const NIFTY_BREAKEVEN_FLOOR_RS = 0;
-export const NIFTY_TRAIL_ARM_RS = 300;
+/**
+ * Breakeven exits on a 1-minute close below the level; a drop this many
+ * points under it exits at once (0 = exit on the first tick below).
+ */
+export const NIFTY_BREAKEVEN_FAST_DROP_POINTS = 4;
+export const NIFTY_TRAIL_ARM_RS = 550;
 export const NIFTY_TRAIL_POINTS = 6;
 /** Once the trail is armed, never give back below this net profit (₹). */
 export const NIFTY_TRAIL_FLOOR_RS = 150;
@@ -162,6 +170,8 @@ export const NIFTY_DAILY_MAX_LOSS_RS = 1500;
 export const NIFTY_DAILY_PROFIT_LOCK_RS = 800;
 export const NIFTY_DAILY_MAX_TRADES = 8;
 export const NIFTY_COOLDOWN_AFTER_LOSS_MIN = 15;
+/** A closed trade within ±this net (₹) is a scratch: not a loss for the cooldown or losing streak. Covers a breakeven exit eaten by charges (~₹120). */
+export const NIFTY_SCRATCH_RS = 150;
 
 /** Paper fills cross the spread: buy at ltp + this, sell at ltp − this (points). */
 export const NIFTY_PAPER_SPREAD_POINTS = 0.5;

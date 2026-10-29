@@ -5,6 +5,7 @@
     "license": "MIT",
     "scripts": {
         "start": "nodemon src/app.ts",
+        "replay:nifty": "ts-node --transpile-only src/scripts/nifty.scalp.replay.ts",
         "migrate": "sequelize-cli db:migrate",
         "migrate:up": "sequelize-cli db:migrate",
         "migrate:undo": "sequelize-cli db:migrate:undo",
