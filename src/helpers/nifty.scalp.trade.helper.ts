@@ -4,11 +4,11 @@ import { db } from '../model';
 import { logger } from '../logger/logger';
 import { isLiveTradingEnabled } from './scalping.trade.helper';
 import {
+    NIFTY_ADD_LOT_POINTS,
     NIFTY_HEDGE_ENABLED,
     NIFTY_MAX_LOTS,
     NIFTY_PAPER_SPREAD_POINTS,
-    NIFTY_STOP_POINTS,
-    NIFTY_BREAKEVEN_ARM_RS,
+    NIFTY_SOFT_LOSS_RS,
     NIFTY_TRAIL_ARM_RS,
     NIFTY_TRAIL_FLOOR_RS,
     NIFTY_TRAIL_POINTS,
@@ -19,6 +19,7 @@ import {
     canAffordLot,
     getNiftyScalpConfig,
     getNiftyStrategyBalance,
+    nextScaleInLots,
     setNiftyStrategyBalance,
     twoLotWithHedgeCost,
     updateNiftyStrategyBalance,
@@ -642,7 +643,7 @@ export const adoptOrphanEntryFill = async ({
             lots,
             target,
             balance: synced,
-            thinking: `BUY ${orderId} had timed out earlier but Upstox filled it at ${fillPrice} (${lots} lot). I created the trade now, so the stop (${NIFTY_STOP_POINTS} pts), trailing and exit rules apply to it like any other trade.`,
+            thinking: `BUY ${orderId} had timed out earlier but Upstox filled it at ${fillPrice} (${lots} lot). I created the trade now. Scale-in adds 2,3,4… lots every ${NIFTY_ADD_LOT_POINTS} pts below avg; flatten at −₹${NIFTY_SOFT_LOSS_RS} or if the next add cannot be funded; trail from net +₹${NIFTY_TRAIL_ARM_RS} after charges.`,
         },
     });
     notifyNiftyEvent(
@@ -722,7 +723,7 @@ export const openNiftyScalpEntry = async ({
         if (reserved == null || balance < reserved) {
             await logNiftyAudit({
                 action: 'SKIP',
-                reason: 'INSUFFICIENT_BALANCE_2LOT',
+                reason: 'INSUFFICIENT_BALANCE',
                 signal,
                 instrumentKey: option.instrument_key,
                 config,
@@ -731,7 +732,7 @@ export const openNiftyScalpEntry = async ({
             });
             notifyNiftyEvent(
                 'CANNOT_ADD_LOT',
-                'Balance cannot cover entry + one add lot',
+                'Strategy balance cannot cover the first lot',
                 { balance, required: reserved },
             );
             return null;
@@ -961,7 +962,7 @@ export const openNiftyScalpEntry = async ({
                     liveMode
                         ? `Upstox confirmed the BUY at ${fillPrice} (quote was ${quoteLtp}, slippage ${(fillPrice - quoteLtp).toFixed(2)} pts)`
                         : `Paper BUY filled at ${fillPrice} (quote ${quoteLtp} + spread)`
-                }${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. Trade created and now managed by the engine: hard stop at ${(fillPrice - NIFTY_STOP_POINTS).toFixed(2)} (-${NIFTY_STOP_POINTS} pts), breakeven protection from net ₹${NIFTY_BREAKEVEN_ARM_RS} (1-minute close, or a fast drop), trailing stop from net ₹${NIFTY_TRAIL_ARM_RS} (peak − ${NIFTY_TRAIL_POINTS} pts, never below +₹${NIFTY_TRAIL_FLOOR_RS}).`,
+                }${hasHedge ? ` + hedge @ ${hedgeFill}` : ''}. First lot is on. Next add is 2 lots if LTP drops ${NIFTY_ADD_LOT_POINTS} pts below avg, then 3, 4, … while strategy balance lasts. Flatten the whole book at −₹${NIFTY_SOFT_LOSS_RS} net, or if an add cannot be funded / Upstox rejects. Target is charges + ₹${NIFTY_TRAIL_ARM_RS}: once touched, SL locks that amount and trails peak − ${NIFTY_TRAIL_POINTS} pts (floor +₹${NIFTY_TRAIL_FLOOR_RS}).`,
             },
             skipThrottle: true,
         });
@@ -980,7 +981,57 @@ export const openNiftyScalpEntry = async ({
     }
 };
 
-export const addNiftyScalpLot = async ({
+export type NiftyScaleInResult =
+    | { status: 'NOT_DUE' }
+    | { status: 'ADDED'; lots: number; newQty: number; newAvg: number }
+    | { status: 'FLATTENED'; reason: string };
+
+const countAddLotLegs = async (tradeId: string): Promise<number> =>
+    db[MODEL.TRADE_LEG_HISTORY].count({
+        where: { trade_uuid: tradeId, leg_type: 'ADD_LOT' },
+    });
+
+const flattenScaleInFail = async ({
+    trade,
+    position,
+    config,
+    reason,
+    thinking,
+    extra,
+}: {
+    trade: any;
+    position: any;
+    config: NiftyScalpConfig;
+    reason: string;
+    thinking: string;
+    extra?: Record<string, unknown>;
+}): Promise<NiftyScaleInResult> => {
+    await logNiftyAudit({
+        action: 'EXIT_DECISION',
+        reason,
+        instrumentKey: trade.instrument_key,
+        tradeId: trade.id,
+        engineState: 'EXITING',
+        config,
+        skipThrottle: true,
+        metadata: {
+            ltp: Number(trade.ltp),
+            avgBuy: Number(trade.buy_price),
+            qty: Number(trade.qty),
+            thinking,
+            ...extra,
+        },
+    });
+    await closeNiftyScalpTrade({ trade, position, config, exitReason: reason });
+    return { status: 'FLATTENED', reason };
+};
+
+/**
+ * Scale-in: when LTP is ≥ add_lot_points below the current average, buy
+ * 2 lots, then 3, then 4, … If that add cannot be funded from strategy
+ * balance or Upstox rejects it, square off the whole position.
+ */
+export const tryNiftyScaleIn = async ({
     trade,
     position,
     config,
@@ -988,81 +1039,87 @@ export const addNiftyScalpLot = async ({
     trade: any;
     position: any;
     config: NiftyScalpConfig;
-}) => {
-    if (trade.exit_pending || trade.exit_halted) return false;
-    if (
-        isLiveTradingEnabled(
-            await getTradingUser(),
-            config,
-        ) &&
-        !trade.broker_confirmed
-    ) {
-        return false;
-    }
+}): Promise<NiftyScaleInResult> => {
+    if (trade.exit_pending || trade.exit_halted) return { status: 'NOT_DUE' };
+    const user = await getTradingUser();
+    const liveMode = isLiveTradingEnabled(user, config);
+    if (liveMode && !trade.broker_confirmed) return { status: 'NOT_DUE' };
 
     const ltp = Number(trade.ltp);
     const lotSize = Number(trade.lot_size);
     const avgBuy = Number(trade.buy_price);
     const qty = Number(trade.qty);
+    const addPoints = Number(config.add_lot_points || NIFTY_ADD_LOT_POINTS);
+    if (!(ltp > 0) || !(lotSize > 0) || !(avgBuy > 0) || !(qty > 0)) {
+        return { status: 'NOT_DUE' };
+    }
+    if (ltp > avgBuy - addPoints) return { status: 'NOT_DUE' };
 
-    if (qty >= NIFTY_MAX_LOTS) return false;
-    if (ltp > avgBuy - config.add_lot_points) return false;
+    const addLegCount = await countAddLotLegs(String(trade.id));
+    const addLots = nextScaleInLots(addLegCount);
+    if (qty + addLots > NIFTY_MAX_LOTS) return { status: 'NOT_DUE' };
 
+    const required = ltp * lotSize * addLots;
     const balance = await getNiftyStrategyBalance(config);
-    if (!canAffordLot(balance, ltp, lotSize)) {
-        await logNiftyAudit({
-            action: 'CANNOT_ADD_LOT',
-            reason: 'INSUFFICIENT_BALANCE_ADD_LOT',
-            instrumentKey: trade.instrument_key,
-            tradeId: trade.id,
-            engineState: 'IN_TRADE',
+    if (!canAffordLot(balance, ltp, lotSize, addLots)) {
+        return flattenScaleInFail({
+            trade,
+            position,
             config,
-            metadata: {
-                ltp,
-                avgBuy,
-                balance,
-                required: ltp * lotSize,
-            },
+            reason: 'INSUFFICIENT_BALANCE_SQUARE_OFF',
+            thinking: `LTP ${ltp} is ${ (avgBuy - ltp).toFixed(2) } pts below avg ${avgBuy}, so the next add is ${addLots} lot(s) (cost ≈ ₹${required.toFixed(0)}). Strategy balance is ₹${balance.toFixed(0)} — not enough. Squaring off the full ${qty} lot position.`,
+            extra: { addLots, balance, required },
         });
-        notifyNiftyEvent(
-            'CANNOT_ADD_LOT',
-            'Price down but not enough money for another lot — holding',
-            { ltp, avgBuy, balance },
-        );
-        return false;
     }
 
-    const user = await getTradingUser();
-    const liveMode = isLiveTradingEnabled(user, config);
-    let addPrice = ltp;
+    let addPrice = liveMode
+        ? ltp
+        : Number((ltp + NIFTY_PAPER_SPREAD_POINTS).toFixed(2));
+    let addOrderId: string | null = null;
 
     if (liveMode) {
         const live = await placeConfirmedUpstoxOrder({
             user,
             config,
             instrumentKey: trade.instrument_key,
-            quantity: lotSize * 1,
+            quantity: lotSize * addLots,
             side: 'BUY',
             purpose: 'ADD_LOT',
             positionId: position.id,
             tradeId: trade.id,
+            why: `Scale-in ${addLots} lot(s): LTP ${ltp} is ${addPoints} pts under avg ${avgBuy}.`,
         });
         if (!live.ok) {
-            // Do not bump qty on failed/pending live add
-            return false;
+            return flattenScaleInFail({
+                trade,
+                position,
+                config,
+                reason: 'ADD_LOT_REJECTED_SQUARE_OFF',
+                thinking: `Tried to add ${addLots} lot(s) at ${ltp} but Upstox did not fill (${errText(live.error || live.status)}). Squaring off the full open position so nothing is left unmanaged.`,
+                extra: { addLots, live },
+            });
         }
         addPrice = Number(live.averagePrice || ltp);
+        addOrderId = live.orderId || null;
+    } else if (!canAffordLot(balance, addPrice, lotSize, addLots)) {
+        return flattenScaleInFail({
+            trade,
+            position,
+            config,
+            reason: 'INSUFFICIENT_BALANCE_SQUARE_OFF',
+            thinking: `Paper add of ${addLots} lot(s) at ${addPrice} needs ₹${(addPrice * lotSize * addLots).toFixed(0)} but strategy balance is ₹${balance.toFixed(0)}. Squaring off.`,
+            extra: { addLots, balance, addPrice },
+        });
     }
 
-    const newQty = qty + 1;
-    const newAvg = (avgBuy * qty + addPrice) / newQty;
+    const newQty = qty + addLots;
+    const newAvg = (avgBuy * qty + addPrice * addLots) / newQty;
     const newTarget = calculateTargetLtp(newAvg, newQty, lotSize, config);
 
     await trade.update({
         qty: newQty,
         buy_price: newAvg,
         target_price: newTarget,
-        stop_loss: 0,
         original_qty: newQty,
         ltp: addPrice,
         broker_confirmed: true,
@@ -1071,9 +1128,13 @@ export const addNiftyScalpLot = async ({
         qty: newQty,
         required_margin: newAvg * lotSize * newQty,
     });
+    trade.qty = newQty;
+    trade.buy_price = newAvg;
+    trade.target_price = newTarget;
+    trade.ltp = addPrice;
 
     if (!liveMode) {
-        await updateNiftyStrategyBalance(-(addPrice * lotSize));
+        await updateNiftyStrategyBalance(-(addPrice * lotSize * addLots));
     } else {
         await syncStrategyBalanceFromUpstox();
     }
@@ -1082,14 +1143,15 @@ export const addNiftyScalpLot = async ({
         trade,
         legType: 'ADD_LOT',
         side: 'BUY',
-        lots: 1,
+        lots: addLots,
         price: addPrice,
         reason: 'DRAWDOWN_10_POINTS',
+        brokerOrderId: addOrderId,
         mode: liveMode ? 'live' : 'paper',
         avgBuyAfter: newAvg,
         qtyAfter: newQty,
         targetAfter: newTarget,
-        metadata: { oldAvg: avgBuy, oldQty: qty },
+        metadata: { oldAvg: avgBuy, oldQty: qty, addLots },
     });
 
     await logNiftyAudit({
@@ -1101,22 +1163,34 @@ export const addNiftyScalpLot = async ({
         config,
         metadata: {
             oldAvg: avgBuy,
+            oldQty: qty,
             newAvg,
             newQty,
             newTarget,
             addPrice,
+            addLots,
             liveMode,
+            thinking: `Added ${addLots} lot(s) @ ${addPrice}. Qty ${qty} → ${newQty}, avg ${avgBuy} → ${newAvg.toFixed(2)}. Next add is ${nextScaleInLots(addLegCount + 1)} lots if LTP drops ${addPoints} pts below the new avg.`,
         },
         skipThrottle: true,
     });
 
     notifyNiftyEvent(
         'LOT_ADDED',
-        `Added 1 lot @ ${addPrice}. New avg ${newAvg.toFixed(2)}`,
-        { newQty, newAvg, newTarget },
+        `Added ${addLots} lot(s) @ ${addPrice}. New avg ${newAvg.toFixed(2)} (${newQty} lots)`,
+        { newQty, newAvg, newTarget, addLots },
     );
 
-    return true;
+    return { status: 'ADDED', lots: addLots, newQty, newAvg };
+};
+
+export const addNiftyScalpLot = async (input: {
+    trade: any;
+    position: any;
+    config: NiftyScalpConfig;
+}) => {
+    const result = await tryNiftyScaleIn(input);
+    return result.status === 'ADDED';
 };
 
 export const closeNiftyScalpTrade = async ({

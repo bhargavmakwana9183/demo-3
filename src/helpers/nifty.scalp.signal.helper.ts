@@ -489,7 +489,7 @@ const canAffordPair = (
     return cost != null && balance >= cost;
 };
 
-/** ATM first; if unaffordable with the 2nd lot (and hedge, when enabled), step to cheaper premium. */
+/** ATM first; if unaffordable for 1 lot (and hedge, when enabled), step to cheaper premium. */
 const firstAffordableMain = async ({
     side,
     atm,
@@ -612,7 +612,7 @@ export const evaluateNiftyOptionSignal = async (
             }
             return {
                 signal: 'NONE',
-                reason: 'CE_INSUFFICIENT_BALANCE_2LOT',
+                reason: 'CE_INSUFFICIENT_BALANCE',
                 indicators: { ...ceSignal.indicators, ...trend.indicators },
             };
         }
@@ -686,7 +686,7 @@ export const evaluateNiftyOptionSignal = async (
         }
         return {
             signal: 'NONE',
-            reason: 'PE_INSUFFICIENT_BALANCE_2LOT',
+            reason: 'PE_INSUFFICIENT_BALANCE',
             indicators: { ...peSignal.indicators, ...trend.indicators },
         };
     }

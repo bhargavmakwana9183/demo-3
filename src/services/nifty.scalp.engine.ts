@@ -15,19 +15,17 @@ import {
 } from '../helpers/nifty.expiry.helper';
 import { buildMarketTime, canOpenNewTrade } from '../helpers/scalping.risk.helper';
 import {
-    NIFTY_BREAKEVEN_ARM_RS,
-    NIFTY_BREAKEVEN_FAST_DROP_POINTS,
+    NIFTY_ADD_LOT_POINTS,
     NIFTY_COOLDOWN_AFTER_LOSS_MIN,
     NIFTY_DAILY_MAX_LOSS_RS,
     NIFTY_DAILY_MAX_TRADES,
     NIFTY_DAILY_PROFIT_LOCK_RS,
     NIFTY_ENTRY_QUIET_UNTIL,
     NIFTY_HEDGE_ENABLED,
+    NIFTY_MAX_EXTENSION_PCT,
     NIFTY_MAX_LOTS,
-    NIFTY_PROFIT_CAP_RS,
     NIFTY_SCRATCH_RS,
     NIFTY_SOFT_LOSS_RS,
-    NIFTY_STOP_POINTS,
     NIFTY_TRAIL_ARM_RS,
     NIFTY_TRAIL_FLOOR_RS,
     NIFTY_TRAIL_POINTS,
@@ -51,6 +49,7 @@ import {
     getEntryCooldownRemainingMs,
     hedgeOpenNet,
     openNiftyScalpEntry,
+    tryNiftyScaleIn,
 } from '../helpers/nifty.scalp.trade.helper';
 import { recordNiftyPriceTick } from '../helpers/nifty.scalp.planb.helper';
 import { logNiftyAudit } from '../helpers/nifty.scalp.audit.helper';
@@ -516,7 +515,12 @@ export class NiftyScalpEngine {
             }
         }
 
-        // One lot per trade: no averaging down, no Plan B.
+        if (plan.stage !== 'TRAILING') {
+            const scale = await tryNiftyScaleIn({ trade, position, config });
+            if (scale.status === 'FLATTENED') return 'SCANNING';
+            if (scale.status === 'ADDED') return 'AVERAGING';
+        }
+
         return 'IN_TRADE';
     }
 
@@ -582,11 +586,11 @@ export class NiftyScalpEngine {
 
         let thinking: string;
         if (last.stage === 'NONE' || savedStop <= 0) {
-            thinking = `Initial stop set at ${newStop} (entry ${avgBuy} − ${NIFTY_STOP_POINTS} pts). Worst case if hit ≈ ₹${lockedNet.toFixed(0)} net.`;
-        } else if (stageChanged && stage === 'BREAKEVEN') {
-            thinking = `Peak net reached ₹${peakNet.toFixed(0)} (≥ ₹${NIFTY_BREAKEVEN_ARM_RS}), so the stop moved UP from ${last.stop} to breakeven ${newStop}. Exit if a 1-minute candle closes at or below that, or at once if price drops ${NIFTY_BREAKEVEN_FAST_DROP_POINTS} pts under it. This trade can no longer turn into a full loss (apart from slippage).`;
+            thinking = `Initial stop set at ${newStop} — the price that flattens at −₹${NIFTY_SOFT_LOSS_RS} net. Scale-in still adds 2,3,4… lots every ${NIFTY_ADD_LOT_POINTS} pts below avg until then.`;
         } else if (stageChanged && stage === 'TRAILING') {
-            thinking = `Peak net reached ₹${peakNet.toFixed(0)} (≥ ₹${NIFTY_TRAIL_ARM_RS}), so trailing started: stop moved UP from ${last.stop} to ${newStop}, which locks about ₹${lockedNet.toFixed(0)} net. From here it follows the peak − ${NIFTY_TRAIL_POINTS} pts.`;
+            thinking = `Peak net reached ₹${peakNet.toFixed(0)} (≥ ₹${NIFTY_TRAIL_ARM_RS} after charges), so the stop moved UP from ${last.stop} to ${newStop}, locking about ₹${lockedNet.toFixed(0)} net. From here it trails peak − ${NIFTY_TRAIL_POINTS} pts and never drops below +₹${NIFTY_TRAIL_FLOOR_RS}.`;
+        } else if (stageChanged && stage === 'BREAKEVEN') {
+            thinking = `Stop moved UP from ${last.stop} to ${newStop} (${stage}).`;
         } else {
             thinking = `New high ${highest}: trailing stop moved UP from ${last.stop} to ${newStop} (peak − ${NIFTY_TRAIL_POINTS} pts), now locking about ₹${lockedNet.toFixed(0)} net.`;
         }
@@ -866,20 +870,17 @@ export class NiftyScalpEngine {
                 mode: config.mode,
                 is_active: config.is_active,
                 target_profit_rs: config.target_profit_rs,
-                add_lot_points: config.add_lot_points,
+                add_lot_points: config.add_lot_points || NIFTY_ADD_LOT_POINTS,
                 enable_plan_b: false,
                 enable_overnight_carry: config.enable_overnight_carry,
                 paper_balance: config.paper_balance,
                 max_lots: NIFTY_MAX_LOTS,
+                max_extension_pct: NIFTY_MAX_EXTENSION_PCT,
                 soft_loss_rs: NIFTY_SOFT_LOSS_RS,
-                stop_points: NIFTY_STOP_POINTS,
                 trail_points: NIFTY_TRAIL_POINTS,
                 trail_floor_rs: NIFTY_TRAIL_FLOOR_RS,
                 trail_arm_rs: NIFTY_TRAIL_ARM_RS,
-                breakeven_arm_rs: NIFTY_BREAKEVEN_ARM_RS,
-                breakeven_fast_drop_points: NIFTY_BREAKEVEN_FAST_DROP_POINTS,
                 scratch_rs: NIFTY_SCRATCH_RS,
-                profit_cap_rs: NIFTY_PROFIT_CAP_RS,
                 daily_max_loss_rs: NIFTY_DAILY_MAX_LOSS_RS,
                 daily_profit_lock_rs: NIFTY_DAILY_PROFIT_LOCK_RS,
                 daily_max_trades: NIFTY_DAILY_MAX_TRADES,
